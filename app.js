@@ -471,6 +471,201 @@ function initModals() {
 }
 
 // ============================================================
+// GENERATE WITH AI
+// ============================================================
+
+// True while a /generate_playlist request is running, so a double-click
+// (or reopening the modal) can't start a second paid generation.
+let aiRequestInFlight = false;
+let aiElapsedTimer = null;
+
+function setAiBusy(busy) {
+  const form    = document.getElementById('ai-form');
+  const btn     = document.getElementById('btn-ai-submit');
+  const status  = document.getElementById('ai-status');
+  const elapsed = document.getElementById('ai-elapsed');
+
+  aiRequestInFlight = busy;
+  btn.disabled = busy;
+  btn.textContent = busy ? 'Generating...' : 'Generate';
+  form.querySelectorAll('input, select').forEach(el => { el.disabled = busy; });
+  form.setAttribute('aria-busy', String(busy));
+  status.classList.toggle('hidden', !busy);
+
+  clearInterval(aiElapsedTimer);
+  elapsed.textContent = '';
+  if (busy) {
+    const start = Date.now();
+    aiElapsedTimer = setInterval(() => {
+      elapsed.textContent = `${Math.floor((Date.now() - start) / 1000)}s`;
+    }, 1000);
+  }
+}
+
+function showAiForm() {
+  document.getElementById('ai-form').classList.remove('hidden');
+  document.getElementById('ai-result').classList.add('hidden');
+}
+
+function platformLabel(platform) {
+  if (platform === 'spotify') return 'Spotify';
+  if (platform === 'youtube') return 'YouTube';
+  return 'Spotify and YouTube';
+}
+
+function showAiResult(data, name, platform) {
+  const added   = data.added || [];
+  const skipped = data.skipped || [];
+  const total   = Number.isInteger(data.total) ? data.total : added.length + skipped.length;
+
+  const summary = document.getElementById('ai-result-summary');
+  const note    = document.getElementById('ai-result-note');
+
+  if (data.playlist_created) {
+    summary.textContent = `Added ${added.length} of ${total} songs`;
+    note.textContent = data.synced
+      ? `"${name}" was created on Spotify and YouTube and is kept synced.`
+      : `"${name}" was created on ${platformLabel(platform)}.`;
+  } else {
+    summary.textContent = 'No playlist was created';
+    note.textContent = data.message || 'None of the suggested songs could be found.';
+  }
+
+  const wrap = document.getElementById('ai-skipped-wrap');
+  const list = document.getElementById('ai-skipped-list');
+  document.getElementById('ai-skipped-title').textContent = `Skipped (${skipped.length})`;
+  list.innerHTML = skipped.map(s => `
+    <li>
+      <span class="ai-skipped-song">${escapeHtml(s.title)} — ${escapeHtml(s.artist)}</span>
+      <span class="ai-skipped-reason">${escapeHtml(s.reason || 'Not found')}</span>
+    </li>
+  `).join('');
+  wrap.classList.toggle('hidden', skipped.length === 0);
+
+  document.getElementById('ai-form').classList.add('hidden');
+  document.getElementById('ai-result').classList.remove('hidden');
+  summary.focus();
+}
+
+// The backend sends friendly messages as `detail` (limit reached, timeout,
+// garbled reply). Anything else gets a generic message, never a raw error.
+function friendlyAiError(status, data) {
+  if (data && typeof data.detail === 'string') return data.detail;
+  if (status === 422) return 'Please check the playlist name and description (the description can be up to 300 characters).';
+  if (status >= 500) return 'Something went wrong on the server. Please try again in a moment.';
+  return 'Something went wrong. Please try again.';
+}
+
+function closeAiModal() {
+  closeModal('modal-ai');
+  document.getElementById('action-menu-btn').focus();
+}
+
+function initAiGenerator() {
+  const modal  = document.getElementById('modal-ai');
+  const form   = document.getElementById('ai-form');
+  const nameEl = document.getElementById('ai-name');
+
+  document.getElementById('btn-generate-ai').addEventListener('click', () => {
+    openModal('modal-ai');
+    if (aiRequestInFlight) {
+      // Still running from before the modal was closed: just show the status.
+      document.getElementById('ai-status').focus();
+      return;
+    }
+    showAiForm();
+    clearModalError('modal-ai');
+    nameEl.focus();
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (aiRequestInFlight) return;
+
+    const name     = nameEl.value.trim();
+    const prompt   = document.getElementById('ai-prompt').value.trim();
+    const platform = document.getElementById('ai-platform').value;
+
+    clearModalError('modal-ai');
+    if (!name) {
+      setModalError('modal-ai', 'Please enter a playlist name.');
+      nameEl.focus();
+      return;
+    }
+    if (!prompt) {
+      setModalError('modal-ai', 'Please describe the music you want.');
+      document.getElementById('ai-prompt').focus();
+      return;
+    }
+
+    setAiBusy(true);
+    document.getElementById('ai-status').focus();
+
+    try {
+      const res = await fetch(`${BASE_URL}/generate_playlist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, prompt, platform, user_id: getUserId() }),
+      });
+
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+
+      if (res.ok && data) {
+        showAiResult(data, name, platform);
+        if (data.playlist_created) loadPlaylists();
+      } else {
+        setModalError('modal-ai', friendlyAiError(res.status, data));
+      }
+    } catch {
+      setModalError(
+        'modal-ai',
+        'Lost connection to the server. Your playlist may still have been created, so check your dashboard before trying again.'
+      );
+    } finally {
+      setAiBusy(false);
+      if (document.getElementById('ai-result').classList.contains('hidden')) {
+        document.getElementById('btn-ai-submit').focus();
+      }
+    }
+  });
+
+  document.getElementById('btn-ai-done').addEventListener('click', closeAiModal);
+
+  // The X button is wired in initModals(); this just returns focus to the menu.
+  modal.querySelector('.modal-close').addEventListener('click', () => {
+    document.getElementById('action-menu-btn').focus();
+  });
+
+  // Keyboard: Escape closes, Tab stays inside the modal.
+  modal.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAiModal();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    const focusable = [...modal.querySelectorAll('button, input, select')]
+      .filter(el => !el.disabled && el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last  = focusable[focusable.length - 1];
+
+    if (e.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+}
+
+// ============================================================
 // DASHBOARD INITIALIZATION
 // ============================================================
 
@@ -487,6 +682,7 @@ function init() {
   initLandingPage();
   initActionMenu();
   initModals();
+  initAiGenerator();
   initDashboard();
 
   // Check if the backend redirected back here after OAuth with a user_id param.

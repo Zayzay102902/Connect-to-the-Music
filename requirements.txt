@@ -8,3 +8,4 @@ google-auth
 google-auth-oauthlib==0.4.6
 google-auth-httplib2
 python-multipart
+anthropic>=2.6,<3

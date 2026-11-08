@@ -40,6 +40,7 @@ A full-stack web application that allows users to create, sync, copy, and manage
 - **Copy a Playlist** — Copy a playlist from one platform to the other. The app searches for each song on the target platform and recreates the playlist there.
 - **Sync Playlists** — For playlists that live on both platforms, pick one as the source of truth and overwrite the other platform's version with its songs.
 - **Delete a Playlist** — Remove a playlist from one platform, both platforms, or just the database.
+- **Generate with AI** — Describe the music you want (e.g. "pumped up workout music") and Claude suggests about 20 real songs. Each song is searched and verified on Spotify and/or YouTube before it's added; songs that can't be found are skipped and listed with the reason.
 - **Logout** — Securely log out of your session. Clears your OAuth access tokens from the database and returns you to the login page, requiring full re-authentication on your next visit.
 - **Delete Your Account** — Permanently remove your account and all associated playlists from the database with a single confirmation.
 
@@ -95,6 +96,12 @@ GOOGLE_REDIRECT_URI=http://127.0.0.1:8000/google_auth/callback
 SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8000/api/spotify/callback
+
+ANTHROPIC_API_KEY=your_anthropic_api_key
+
+# Optional (defaults shown)
+AI_DAILY_LIMIT=5
+AI_GLOBAL_DAILY_LIMIT=100
 ```
 
 | Variable                  | Description                                                                                         |
@@ -107,6 +114,9 @@ SPOTIFY_REDIRECT_URI=http://127.0.0.1:8000/api/spotify/callback
 | `SPOTIFY_CLIENT_ID`       | The Client ID from your app in the Spotify Developer Dashboard.                                     |
 | `SPOTIFY_CLIENT_SECRET`   | The Client Secret from your app in the Spotify Developer Dashboard.                                 |
 | `SPOTIFY_REDIRECT_URI`    | The redirect URI registered in Spotify. Must be `http://127.0.0.1:8000/api/spotify/callback`.       |
+| `ANTHROPIC_API_KEY`       | Claude API key for Generate with AI. Server-side only — never sent to the browser. On Render, set it under Environment. |
+| `AI_DAILY_LIMIT`          | Optional. AI generations per user per day (UTC). Default `5`.                                       |
+| `AI_GLOBAL_DAILY_LIMIT`   | Optional. AI generations across all users per day (UTC). Default `100`. Caps daily API spend.       |
 
 ---
 
@@ -143,6 +153,28 @@ CREATE TABLE playlists (
     spotify_playlist_id TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (user_id, playlist_name)
+);
+
+-- Generate with AI: one row per billed Claude call (daily limits + token usage)
+CREATE TABLE ai_generations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    prompt TEXT,
+    input_tokens INT,
+    output_tokens INT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX ai_generations_user_day_idx ON ai_generations (user_id, created_at);
+CREATE INDEX ai_generations_day_idx ON ai_generations (created_at);
+
+-- Generate with AI: cache of verified matches (saves YouTube quota)
+CREATE TABLE song_cache (
+    title_key TEXT NOT NULL,
+    artist_key TEXT NOT NULL,
+    spotify_track_id TEXT,
+    youtube_video_id TEXT,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (title_key, artist_key)
 );
 ```
 
@@ -303,6 +335,22 @@ The app will find the playlist on the selected platform, pull its songs, save ev
 
 ---
 
+### Generate with AI
+
+**What it does:** Builds a new playlist from a short description using Claude (`claude-haiku-5-5`).
+
+**How to use it:**
+- Open **Actions > Generate with AI**.
+- Enter a playlist name and describe the music (up to 300 characters).
+- Pick **Both** (default), **Spotify**, or **YouTube**. **Both** turns on Keep Synced and only adds songs found on both platforms.
+- Click **Generate**. It can take up to a minute. When it finishes you'll see "Added X of Y songs" plus any skipped songs and why.
+
+**How it works:** Claude returns up to 20 songs as JSON. Each song is checked against the song cache, then searched on the platform. The top results must match the title and artist loosely (case, "feat.", "(Remastered)" and similar extras are ignored), and on YouTube official uploads (VEVO, "- Topic", the artist's own channel) are preferred. Songs that don't match are skipped. Each user gets `AI_DAILY_LIMIT` generations per day, and there's an overall `AI_GLOBAL_DAILY_LIMIT`; both are checked before Claude is called.
+
+**Backend endpoint:** `POST /generate_playlist`
+
+---
+
 ### Logout
 
 **What it does:** Ends your current session securely. Clears your YouTube and Spotify access tokens from the database (refresh tokens are preserved so re-authentication is smooth), removes your session from the browser, and returns you to the login page.
@@ -348,6 +396,7 @@ The app will find the playlist on the selected platform, pull its songs, save ev
 | `POST`   | `/copy_playlist`            | `name`, `user_id`, `platform`, `sync` (bool)                 | Copies playlist to the other platform                    |
 | `POST`   | `/sync_playlist`            | `name`, `user_id`, `override_platform`                       | Overwrites one platform's playlist with the other's      |
 | `DELETE` | `/delete_playlist`          | `name`, `user_id`, `platform`                                | Deletes playlist from platform(s) and/or DB              |
+| `POST`   | `/generate_playlist`        | `name`, `prompt`, `platform`, `user_id`                      | AI-generated playlist; returns added and skipped songs   |
 | `POST`   | `/logout`                   | `user_id`                                                    | Clears access tokens in DB; user must re-auth on login   |
 | `DELETE` | `/delete_account`           | `user_id`                                                    | Deletes user account and all associated playlists        |
 
