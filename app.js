@@ -151,6 +151,50 @@ function renderPlaylists(playlists) {
 }
 
 // ============================================================
+// ACTION MENU DROPDOWN
+// ============================================================
+
+function initActionMenu() {
+  const toggle = document.getElementById('action-menu-btn');
+  const list   = document.getElementById('action-menu-list');
+
+  function openMenu() {
+    list.classList.add('open');
+    toggle.setAttribute('aria-expanded', 'true');
+    const first = list.querySelector('.menu-item');
+    if (first) first.focus();
+  }
+
+  function closeMenu() {
+    list.classList.remove('open');
+    toggle.setAttribute('aria-expanded', 'false');
+  }
+
+  toggle.addEventListener('click', () => {
+    list.classList.contains('open') ? closeMenu() : openMenu();
+  });
+
+  // Close when any item is activated (the item's own listener fires next).
+  list.addEventListener('click', (e) => {
+    if (e.target.classList.contains('menu-item')) closeMenu();
+  });
+
+  // Keyboard: Escape closes; Arrow keys move focus between items.
+  list.addEventListener('keydown', (e) => {
+    const items = [...list.querySelectorAll('.menu-item')];
+    const idx   = items.indexOf(document.activeElement);
+    if (e.key === 'Escape') { closeMenu(); toggle.focus(); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); items[(idx + 1) % items.length].focus(); }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); items[(idx - 1 + items.length) % items.length].focus(); }
+  });
+
+  // Close when clicking outside the menu.
+  document.addEventListener('click', (e) => {
+    if (!toggle.contains(e.target) && !list.contains(e.target)) closeMenu();
+  });
+}
+
+// ============================================================
 // MODALS — OPEN / CLOSE
 // ============================================================
 
@@ -441,6 +485,7 @@ function initDashboard() {
 
 function init() {
   initLandingPage();
+  initActionMenu();
   initModals();
   initDashboard();
 
