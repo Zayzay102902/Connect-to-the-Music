@@ -141,8 +141,13 @@ function renderPlaylists(playlists) {
     return;
   }
 
-  grid.innerHTML = playlists.map(pl => `
-    <div class="playlist-card">
+  loadedPlaylists = playlists;
+
+  // role="button" + tabindex make the card clickable from the keyboard;
+  // the handlers live in initTracksModal().
+  grid.innerHTML = playlists.map((pl, i) => `
+    <div class="playlist-card" role="button" tabindex="0" aria-haspopup="dialog"
+         data-index="${i}" aria-label="Show songs in ${escapeHtml(pl.name)}">
       ${getPlatformIcon(pl.platform)}
       <div class="playlist-name">${escapeHtml(pl.name)}</div>
       <div class="playlist-date">${formatDate(pl.created_at)}</div>
@@ -666,6 +671,179 @@ function initAiGenerator() {
 }
 
 // ============================================================
+// PLAYLIST SONGS MODAL
+// ============================================================
+
+// The playlists currently shown as cards (card data-index points into this).
+let loadedPlaylists = [];
+// Bumped on every open and close, so a slow reply for an earlier card
+// (or a closed modal) is ignored instead of overwriting the current view.
+let tracksRequestId = 0;
+let tracksReturnFocus = null;
+
+function setTracksLoading(loading) {
+  document.getElementById('tracks-status').classList.toggle('hidden', !loading);
+  document.getElementById('tracks-status-text').textContent = loading ? 'Loading songs...' : '';
+}
+
+function showTracksError(msg) {
+  setTracksLoading(false);
+  document.getElementById('tracks-body').innerHTML =
+    `<p class="modal-error" role="alert">${escapeHtml(msg)}</p>`;
+}
+
+function renderTrackSection(label, section) {
+  let count = '';
+  if (section.status === 'ok') {
+    const n = section.songs.length;
+    count = ` · ${n} song${n === 1 ? '' : 's'}`;
+  }
+  let html = `<h3 class="field-label tracks-heading">${label}${count}</h3>`;
+
+  if (section.status === 'auth_expired') {
+    html += `<p class="modal-error" role="alert">${escapeHtml(
+      section.message || `Your ${label} login has expired. Please log out and sign in again.`
+    )}</p>`;
+    return `<section class="tracks-section">${html}</section>`;
+  }
+  if (section.status !== 'ok') {
+    html += `<p class="modal-error" role="alert">${escapeHtml(
+      section.message || `Couldn't load songs from ${label}. Please try again.`
+    )}</p>`;
+    return `<section class="tracks-section">${html}</section>`;
+  }
+
+  if (!section.songs.length) {
+    html += `<p class="tracks-note">This playlist has no songs on ${label}.</p>`;
+  } else {
+    html += '<ol class="tracks-list">' + section.songs.map(s =>
+      s.artist
+        ? `<li>${escapeHtml(s.title)} - ${escapeHtml(s.artist)}</li>`
+        : `<li>${escapeHtml(s.title)}</li>`
+    ).join('') + '</ol>';
+  }
+  if (section.hidden) {
+    html += `<p class="tracks-note">${section.hidden} unavailable video${section.hidden === 1 ? '' : 's'} (deleted or private) not shown.</p>`;
+  }
+  if (section.truncated) {
+    html += `<p class="tracks-note">Showing the first ${section.songs.length} songs.</p>`;
+  }
+  return `<section class="tracks-section">${html}</section>`;
+}
+
+async function openTracksModal(card) {
+  const pl = loadedPlaylists[Number(card.dataset.index)];
+  if (!pl) return;
+
+  const requestId = ++tracksRequestId;
+  tracksReturnFocus = card;
+
+  document.getElementById('modal-tracks-title').textContent = pl.name;
+  document.getElementById('tracks-body').innerHTML = '';
+  setTracksLoading(true);
+  openModal('modal-tracks');
+  document.getElementById('modal-tracks-title').focus();
+
+  const query = `name=${encodeURIComponent(pl.name)}&user_id=${encodeURIComponent(getUserId())}`;
+  let res;
+  let data = null;
+  try {
+    res = await fetch(`${BASE_URL}/playlist_tracks?${query}`);
+    try {
+      data = await res.json();
+    } catch {
+      data = null;
+    }
+  } catch {
+    if (requestId !== tracksRequestId) return;
+    showTracksError('Could not connect to the server. Please try again.');
+    return;
+  }
+  if (requestId !== tracksRequestId) return;
+
+  if (res.status === 401) {
+    showTracksError('Your login has expired. Please log out and sign in again.');
+    return;
+  }
+  if (!res.ok || !data) {
+    showTracksError(
+      (data && typeof data.detail === 'string') ? data.detail : 'Couldn\'t load the songs. Please try again.'
+    );
+    return;
+  }
+
+  let html = '';
+  if (data.spotify) html += renderTrackSection('Spotify', data.spotify);
+  if (data.youtube) html += renderTrackSection('YouTube', data.youtube);
+  setTracksLoading(false);
+  document.getElementById('tracks-body').innerHTML =
+    html || '<p class="tracks-note">This playlist isn\'t linked to Spotify or YouTube.</p>';
+}
+
+function closeTracksModal() {
+  tracksRequestId++;
+  closeModal('modal-tracks');
+  // The grid may have re-rendered while the modal was open.
+  if (tracksReturnFocus && tracksReturnFocus.isConnected) tracksReturnFocus.focus();
+  tracksReturnFocus = null;
+}
+
+function initTracksModal() {
+  const grid  = document.getElementById('playlist-grid');
+  const modal = document.getElementById('modal-tracks');
+
+  grid.addEventListener('click', (e) => {
+    // Leave clicks on any control inside a card to that control.
+    if (e.target.closest('button, a, input, select, textarea, label')) return;
+    const card = e.target.closest('.playlist-card');
+    if (card) openTracksModal(card);
+  });
+
+  grid.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    // Only when the card itself has focus, not a control inside it.
+    if (!e.target.classList.contains('playlist-card')) return;
+    e.preventDefault();
+    openTracksModal(e.target);
+  });
+
+  // initModals() already hides the modal on X / backdrop click; these
+  // also cancel the pending request and return focus to the card.
+  modal.querySelector('.modal-close').addEventListener('click', closeTracksModal);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeTracksModal();
+  });
+
+  // Listen on the document so Escape works even after a click inside the
+  // modal has moved focus to <body>.
+  document.addEventListener('keydown', (e) => {
+    if (modal.classList.contains('hidden')) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeTracksModal();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    // Keep Tab inside the modal (close button <-> song list).
+    const focusable = [...modal.querySelectorAll('button, [tabindex="0"]')]
+      .filter(el => el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last  = focusable[focusable.length - 1];
+    const inside = modal.contains(document.activeElement);
+
+    if (e.shiftKey && (!inside || document.activeElement === first)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (!inside || document.activeElement === last)) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+}
+
+// ============================================================
 // DASHBOARD INITIALIZATION
 // ============================================================
 
@@ -683,6 +861,7 @@ function init() {
   initActionMenu();
   initModals();
   initAiGenerator();
+  initTracksModal();
   initDashboard();
 
   // Check if the backend redirected back here after OAuth with a user_id param.

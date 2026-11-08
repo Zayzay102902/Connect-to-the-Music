@@ -1098,6 +1098,197 @@ def get_playlists(user_id: str):
 
 
 # ============================================================
+# PLAYLIST TRACKS (song list modal on the dashboard)
+# ============================================================
+
+# Both APIs return at most 50 items per page, so 20 pages = 1,000 songs.
+# On YouTube each page is one playlistItems.list call = 1 quota unit.
+TRACKS_MAX_PAGES = 20
+TRACKS_TIMEOUT_SECONDS = 10
+
+# YouTube keeps these placeholders in a playlist after a video is removed.
+YOUTUBE_UNAVAILABLE_TITLES = {"Deleted video", "Private video"}
+
+
+class PlatformAuthError(Exception):
+    pass
+
+
+class PlatformFetchError(Exception):
+    def __init__(self, status_code: int, reason: str = ""):
+        super().__init__(f"HTTP {status_code} {reason}".strip())
+        self.status_code = status_code
+        self.reason = reason
+
+
+def check_platform_response(response):
+    if response.status_code == 401:
+        raise PlatformAuthError()
+    if response.status_code != 200:
+        reason = ""
+        try:
+            errors = response.json().get("error", {}).get("errors", [])
+            if errors:
+                reason = errors[0].get("reason", "")
+        except Exception:
+            pass
+        raise PlatformFetchError(response.status_code, reason)
+
+
+def youtube_display_song(raw_title: str, channel_title: str):
+    # Use parse_youtube_title() to split out the artist. If it throws or
+    # gives back an empty title or artist, show the raw title on its own.
+    raw_title = html.unescape(raw_title or "").strip()
+    channel_title = html.unescape(channel_title or "").strip()
+    if channel_title:
+        try:
+            parsed = parse_youtube_title(raw_title, channel_title)
+            if parsed.get("title") and parsed.get("artist"):
+                return {"title": parsed["title"], "artist": parsed["artist"]}
+        except Exception:
+            pass
+    return {"title": raw_title, "artist": None}
+
+
+def fetch_youtube_tracks(yt_id: str, yt_access_token: str):
+    songs = []
+    hidden = 0
+    page_token = None
+    for _ in range(TRACKS_MAX_PAGES):
+        params = {"part": "snippet", "playlistId": yt_id, "maxResults": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        response = requests.get(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            headers={"Authorization": f"Bearer {yt_access_token}"},
+            params=params,
+            timeout=TRACKS_TIMEOUT_SECONDS,
+        )
+        check_platform_response(response)
+        data = response.json()
+
+        for item in data.get("items", []):
+            snippet = item.get("snippet", {})
+            title = snippet.get("title", "")
+            channel = snippet.get("videoOwnerChannelTitle")
+            if not channel and title in YOUTUBE_UNAVAILABLE_TITLES:
+                hidden += 1
+                continue
+            if not title:
+                continue
+            songs.append(youtube_display_song(title, channel))
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return {"songs": songs, "hidden": hidden, "truncated": bool(page_token)}
+
+
+def fetch_spotify_tracks(sp_id: str, sp_access_token: str):
+    songs = []
+    url = f"https://api.spotify.com/v1/playlists/{sp_id}/items"
+    params = {"limit": 50}
+    for _ in range(TRACKS_MAX_PAGES):
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {sp_access_token}"},
+            params=params,
+            timeout=TRACKS_TIMEOUT_SECONDS,
+        )
+        check_platform_response(response)
+        data = response.json()
+
+        for entry in data.get("items", []):
+            track = entry.get("item") or entry.get("track") or {}
+            name = track.get("name")
+            if not name:
+                continue
+            artists = [a.get("name") for a in track.get("artists") or [] if a.get("name")]
+            # Podcast episodes have no artists; show the show's name instead.
+            if not artists and (track.get("show") or {}).get("name"):
+                artists = [track["show"]["name"]]
+            songs.append({"title": name, "artist": ", ".join(artists) or None})
+
+        # "next" is a full URL that already carries offset and limit.
+        url = data.get("next")
+        params = None
+        if not url:
+            break
+
+    return {"songs": songs, "hidden": 0, "truncated": bool(url)}
+
+
+def load_platform_tracks(platform: Platform, playlist_id: str, user_id: str):
+    label = "Spotify" if platform == Platform.SPOTIFY else "YouTube"
+    login_expired = {
+        "status": "auth_expired",
+        "message": f"Your {label} login has expired. Please log out and sign in again.",
+    }
+
+    if not playlist_id:
+        return {"status": "error", "message": f"This playlist isn't linked to {label}."}
+
+    try:
+        if platform == Platform.SPOTIFY:
+            token = get_valid_spotify_token(user_id)
+            result = fetch_spotify_tracks(playlist_id, token)
+        else:
+            token = get_valid_youtube_token(user_id)
+            result = fetch_youtube_tracks(playlist_id, token)
+    except PlatformAuthError:
+        return login_expired
+    except HTTPException as e:
+        # The token helpers raise 401 when there's no token or refresh failed.
+        if e.status_code == 401:
+            return login_expired
+        print(f"playlist_tracks: {label} token error for user {user_id}: {e.detail}")
+        return {"status": "error", "message": f"Couldn't load songs from {label}. Please try again in a moment."}
+    except PlatformFetchError as e:
+        print(f"playlist_tracks: {label} returned {e} for playlist {playlist_id}")
+        if e.status_code == 404:
+            message = f"This playlist couldn't be found on {label}. It may have been deleted there."
+        elif e.status_code == 403 and e.reason in ("quotaExceeded", "dailyLimitExceeded"):
+            message = "YouTube's daily limit for this app has been reached. Please try again tomorrow."
+        elif e.status_code == 429:
+            message = f"{label} is busy right now. Please try again in a minute."
+        else:
+            message = f"Couldn't load songs from {label}. Please try again in a moment."
+        return {"status": "error", "message": message}
+    except Exception as e:
+        print(f"playlist_tracks: {label} fetch failed for playlist {playlist_id}: {e}")
+        return {"status": "error", "message": f"Couldn't load songs from {label}. Please try again in a moment."}
+
+    return {"status": "ok", **result}
+
+
+@app.get("/playlist_tracks")
+def get_playlist_tracks(name: str, user_id: str):
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT platform, youtube_playlist_id, spotify_playlist_id FROM playlists WHERE playlist_name = %s AND user_id = %s",
+                (name, user_id),
+            )
+            row = cur.fetchone()
+        finally:
+            cur.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Playlist not found.")
+
+    platform, yt_id, sp_id = row
+    # Each platform gets its own section, so one failing doesn't hide the other.
+    result = {"name": name, "platform": platform}
+    if platform in (Platform.SPOTIFY, Platform.BOTH):
+        result["spotify"] = load_platform_tracks(Platform.SPOTIFY, sp_id, user_id)
+    if platform in (Platform.YOUTUBE, Platform.BOTH):
+        result["youtube"] = load_platform_tracks(Platform.YOUTUBE, yt_id, user_id)
+    return result
+
+
+# ============================================================
 # AI PLAYLIST GENERATOR
 # ============================================================
 

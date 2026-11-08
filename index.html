@@ -178,6 +178,19 @@
     </div>
   </div>
 
+  <!-- ===== MODAL: PLAYLIST SONGS ===== -->
+  <div id="modal-tracks" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-tracks-title">
+    <div class="modal-card tracks-card">
+      <button class="modal-close" aria-label="Close">&times;</button>
+      <h2 id="modal-tracks-title" class="modal-title" tabindex="-1">Songs</h2>
+      <p id="tracks-status" class="ai-status" role="status" aria-live="polite">
+        <span class="ai-spinner" aria-hidden="true"></span>
+        <span id="tracks-status-text">Loading songs...</span>
+      </p>
+      <div id="tracks-body" class="tracks-body" tabindex="0" aria-label="Songs in this playlist"></div>
+    </div>
+  </div>
+
   <!-- ===== MODAL: LOGOUT ===== -->
   <div id="modal-logout" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-logout-title">
     <div class="modal-card">

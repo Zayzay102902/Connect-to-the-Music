@@ -391,3 +391,163 @@ def test_clean_ai_songs_filters_bad_entries():
     assert songs[0] == {"title": "Eye of the Tiger", "artist": "Survivor"}
     assert len(songs) == 20
     assert clean_ai_songs("not a list") == []
+
+
+# ---------------- Playlist tracks (song list modal) ----------------
+
+from main import fetch_youtube_tracks, fetch_spotify_tracks, youtube_display_song
+
+
+def fake_response(status_code=200, body=None):
+    response = MagicMock(status_code=status_code)
+    response.json.return_value = body or {}
+    return response
+
+
+def yt_playlist_item(title, channel=None):
+    snippet = {"title": title}
+    if channel is not None:
+        snippet["videoOwnerChannelTitle"] = channel
+    return {"snippet": snippet}
+
+
+def test_youtube_display_song_parses_and_falls_back():
+    assert youtube_display_song("Eminem - Lose Yourself (Official Video)", "EminemVEVO") == {
+        "title": "Lose Yourself", "artist": "Eminem"
+    }
+    assert youtube_display_song("Eye of the Tiger", "Survivor - Topic") == {
+        "title": "Eye of the Tiger", "artist": "Survivor"
+    }
+    assert youtube_display_song("Rock &amp; Roll", "Led Zeppelin") == {
+        "title": "Rock & Roll", "artist": "Led Zeppelin"
+    }
+    # No channel: raw title, no artist.
+    assert youtube_display_song("Some Upload", None) == {"title": "Some Upload", "artist": None}
+    # Parser throws: raw title, no artist.
+    with patch.object(main_module, "parse_youtube_title", side_effect=ValueError("boom")):
+        assert youtube_display_song("Weird (Title)", "Chan") == {"title": "Weird (Title)", "artist": None}
+    # Parser returns an empty title (everything was in brackets): raw title.
+    assert youtube_display_song("[Official Video]", "Some Channel") == {
+        "title": "[Official Video]", "artist": None
+    }
+
+
+def test_fetch_youtube_tracks_pages_and_skips_unavailable():
+    pages = [
+        fake_response(body={
+            "items": [
+                yt_playlist_item("Eminem - Lose Yourself (Official Video)", "EminemVEVO"),
+                yt_playlist_item("Deleted video"),
+            ],
+            "nextPageToken": "P2",
+        }),
+        fake_response(body={
+            "items": [
+                yt_playlist_item("Private video"),
+                yt_playlist_item("Eye of the Tiger", "Survivor - Topic"),
+            ],
+        }),
+    ]
+    with patch("main.requests.get", side_effect=pages) as get:
+        result = fetch_youtube_tracks("PL1", "yt")
+
+    assert result == {
+        "songs": [
+            {"title": "Lose Yourself", "artist": "Eminem"},
+            {"title": "Eye of the Tiger", "artist": "Survivor"},
+        ],
+        "hidden": 2,
+        "truncated": False,
+    }
+    assert get.call_count == 2
+    assert get.call_args_list[0].kwargs["params"]["maxResults"] == 50
+    assert get.call_args_list[1].kwargs["params"]["pageToken"] == "P2"
+
+
+def test_fetch_youtube_tracks_stops_at_page_cap():
+    endless = fake_response(body={"items": [yt_playlist_item("A - B", "A")], "nextPageToken": "MORE"})
+    with patch("main.requests.get", return_value=endless) as get:
+        result = fetch_youtube_tracks("PL1", "yt")
+    assert get.call_count == main_module.TRACKS_MAX_PAGES
+    assert result["truncated"] is True
+
+
+def test_fetch_spotify_tracks_follows_next_and_skips_empty():
+    first = fake_response(body={
+        "items": [
+            {"item": {"name": "Lose Yourself", "artists": [{"name": "Eminem"}]}},
+            {"item": None},  # removed track
+            {"item": {"name": "Collab", "artists": [{"name": "A"}, {"name": "B"}]}},
+        ],
+        "next": "https://api.spotify.com/v1/playlists/SP/items?offset=50&limit=50",
+    })
+    second = fake_response(body={
+        "items": [{"item": {"name": "Episode 1", "artists": [], "show": {"name": "My Podcast"}}}],
+        "next": None,
+    })
+    with patch("main.requests.get", side_effect=[first, second]) as get:
+        result = fetch_spotify_tracks("SP", "sp")
+
+    assert result["songs"] == [
+        {"title": "Lose Yourself", "artist": "Eminem"},
+        {"title": "Collab", "artist": "A, B"},
+        {"title": "Episode 1", "artist": "My Podcast"},
+    ]
+    assert result["truncated"] is False
+    assert get.call_args_list[1].args[0].endswith("offset=50&limit=50")
+
+
+def get_tracks(platform, yt_id="YT", sp_id="SP", **patches):
+    with patch.object(main_module, "get_db_conn", fake_db_returning((platform, yt_id, sp_id))), \
+         patch.object(main_module, "get_valid_spotify_token", **patches.get("sp_token", {"return_value": "sp"})), \
+         patch.object(main_module, "get_valid_youtube_token", **patches.get("yt_token", {"return_value": "yt"})), \
+         patch("main.requests.get", side_effect=patches.get("get")) as get:
+        response = client.get("/playlist_tracks", params={"name": "Mix", "user_id": "u1"})
+    return response, get
+
+
+def test_playlist_tracks_both_one_platform_fails():
+    def fake_get(url, **kwargs):
+        if "spotify" in url:
+            return fake_response(body={"items": [{"item": {"name": "Song", "artists": [{"name": "Band"}]}}]})
+        return fake_response(500)
+
+    response, _ = get_tracks("both", get=fake_get)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["spotify"]["status"] == "ok"
+    assert data["spotify"]["songs"] == [{"title": "Song", "artist": "Band"}]
+    assert data["youtube"]["status"] == "error"
+    assert "YouTube" in data["youtube"]["message"]
+
+
+def test_playlist_tracks_youtube_401_is_auth_expired():
+    response, _ = get_tracks("youtube", get=lambda url, **kw: fake_response(401))
+    data = response.json()
+    assert response.status_code == 200
+    assert "spotify" not in data
+    assert data["youtube"]["status"] == "auth_expired"
+    assert "sign in again" in data["youtube"]["message"]
+
+
+def test_playlist_tracks_token_refresh_401_is_auth_expired():
+    from fastapi import HTTPException as FastAPIHTTPException
+
+    response, get = get_tracks(
+        "spotify",
+        sp_token={"side_effect": FastAPIHTTPException(status_code=401, detail="refresh failed")},
+    )
+    assert response.json()["spotify"]["status"] == "auth_expired"
+    get.assert_not_called()
+
+
+def test_playlist_tracks_youtube_quota_message():
+    quota = fake_response(403, {"error": {"errors": [{"reason": "quotaExceeded"}]}})
+    response, _ = get_tracks("youtube", get=lambda url, **kw: quota)
+    assert "daily limit" in response.json()["youtube"]["message"]
+
+
+def test_playlist_tracks_not_found():
+    with patch.object(main_module, "get_db_conn", fake_db_returning(None)):
+        response = client.get("/playlist_tracks", params={"name": "Nope", "user_id": "u1"})
+    assert response.status_code == 404
