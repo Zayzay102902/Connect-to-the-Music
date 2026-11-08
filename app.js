@@ -141,8 +141,13 @@ function renderPlaylists(playlists) {
     return;
   }
 
-  grid.innerHTML = playlists.map(pl => `
-    <div class="playlist-card">
+  loadedPlaylists = playlists;
+
+  // role="button" + tabindex make the card clickable from the keyboard;
+  // the handlers live in initTracksModal().
+  grid.innerHTML = playlists.map((pl, i) => `
+    <div class="playlist-card" role="button" tabindex="0" aria-haspopup="dialog"
+         data-index="${i}" aria-label="Show songs in ${escapeHtml(pl.name)}">
       ${getPlatformIcon(pl.platform)}
       <div class="playlist-name">${escapeHtml(pl.name)}</div>
       <div class="playlist-date">${formatDate(pl.created_at)}</div>
@@ -471,6 +476,374 @@ function initModals() {
 }
 
 // ============================================================
+// GENERATE WITH AI
+// ============================================================
+
+// True while a /generate_playlist request is running, so a double-click
+// (or reopening the modal) can't start a second paid generation.
+let aiRequestInFlight = false;
+let aiElapsedTimer = null;
+
+function setAiBusy(busy) {
+  const form    = document.getElementById('ai-form');
+  const btn     = document.getElementById('btn-ai-submit');
+  const status  = document.getElementById('ai-status');
+  const elapsed = document.getElementById('ai-elapsed');
+
+  aiRequestInFlight = busy;
+  btn.disabled = busy;
+  btn.textContent = busy ? 'Generating...' : 'Generate';
+  form.querySelectorAll('input, select').forEach(el => { el.disabled = busy; });
+  form.setAttribute('aria-busy', String(busy));
+  status.classList.toggle('hidden', !busy);
+
+  clearInterval(aiElapsedTimer);
+  elapsed.textContent = '';
+  if (busy) {
+    const start = Date.now();
+    aiElapsedTimer = setInterval(() => {
+      elapsed.textContent = `${Math.floor((Date.now() - start) / 1000)}s`;
+    }, 1000);
+  }
+}
+
+function showAiForm() {
+  document.getElementById('ai-form').classList.remove('hidden');
+  document.getElementById('ai-result').classList.add('hidden');
+}
+
+function platformLabel(platform) {
+  if (platform === 'spotify') return 'Spotify';
+  if (platform === 'youtube') return 'YouTube';
+  return 'Spotify and YouTube';
+}
+
+function showAiResult(data, name, platform) {
+  const added   = data.added || [];
+  const skipped = data.skipped || [];
+  const total   = Number.isInteger(data.total) ? data.total : added.length + skipped.length;
+
+  const summary = document.getElementById('ai-result-summary');
+  const note    = document.getElementById('ai-result-note');
+
+  if (data.playlist_created) {
+    summary.textContent = `Added ${added.length} of ${total} songs`;
+    note.textContent = data.synced
+      ? `"${name}" was created on Spotify and YouTube and is kept synced.`
+      : `"${name}" was created on ${platformLabel(platform)}.`;
+  } else {
+    summary.textContent = 'No playlist was created';
+    note.textContent = data.message || 'None of the suggested songs could be found.';
+  }
+
+  const wrap = document.getElementById('ai-skipped-wrap');
+  const list = document.getElementById('ai-skipped-list');
+  document.getElementById('ai-skipped-title').textContent = `Skipped (${skipped.length})`;
+  list.innerHTML = skipped.map(s => `
+    <li>
+      <span class="ai-skipped-song">${escapeHtml(s.title)} — ${escapeHtml(s.artist)}</span>
+      <span class="ai-skipped-reason">${escapeHtml(s.reason || 'Not found')}</span>
+    </li>
+  `).join('');
+  wrap.classList.toggle('hidden', skipped.length === 0);
+
+  document.getElementById('ai-form').classList.add('hidden');
+  document.getElementById('ai-result').classList.remove('hidden');
+  summary.focus();
+}
+
+// The backend sends friendly messages as `detail` (limit reached, timeout,
+// garbled reply). Anything else gets a generic message, never a raw error.
+function friendlyAiError(status, data) {
+  if (data && typeof data.detail === 'string') return data.detail;
+  if (status === 422) return 'Please check the playlist name and description (the description can be up to 300 characters).';
+  if (status >= 500) return 'Something went wrong on the server. Please try again in a moment.';
+  return 'Something went wrong. Please try again.';
+}
+
+function closeAiModal() {
+  closeModal('modal-ai');
+  document.getElementById('action-menu-btn').focus();
+}
+
+function initAiGenerator() {
+  const modal  = document.getElementById('modal-ai');
+  const form   = document.getElementById('ai-form');
+  const nameEl = document.getElementById('ai-name');
+
+  document.getElementById('btn-generate-ai').addEventListener('click', () => {
+    openModal('modal-ai');
+    if (aiRequestInFlight) {
+      // Still running from before the modal was closed: just show the status.
+      document.getElementById('ai-status').focus();
+      return;
+    }
+    showAiForm();
+    clearModalError('modal-ai');
+    nameEl.focus();
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (aiRequestInFlight) return;
+
+    const name     = nameEl.value.trim();
+    const prompt   = document.getElementById('ai-prompt').value.trim();
+    const platform = document.getElementById('ai-platform').value;
+
+    clearModalError('modal-ai');
+    if (!name) {
+      setModalError('modal-ai', 'Please enter a playlist name.');
+      nameEl.focus();
+      return;
+    }
+    if (!prompt) {
+      setModalError('modal-ai', 'Please describe the music you want.');
+      document.getElementById('ai-prompt').focus();
+      return;
+    }
+
+    setAiBusy(true);
+    document.getElementById('ai-status').focus();
+
+    try {
+      const res = await fetch(`${BASE_URL}/generate_playlist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, prompt, platform, user_id: getUserId() }),
+      });
+
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+
+      if (res.ok && data) {
+        showAiResult(data, name, platform);
+        if (data.playlist_created) loadPlaylists();
+      } else {
+        setModalError('modal-ai', friendlyAiError(res.status, data));
+      }
+    } catch {
+      setModalError(
+        'modal-ai',
+        'Lost connection to the server. Your playlist may still have been created, so check your dashboard before trying again.'
+      );
+    } finally {
+      setAiBusy(false);
+      if (document.getElementById('ai-result').classList.contains('hidden')) {
+        document.getElementById('btn-ai-submit').focus();
+      }
+    }
+  });
+
+  document.getElementById('btn-ai-done').addEventListener('click', closeAiModal);
+
+  // The X button is wired in initModals(); this just returns focus to the menu.
+  modal.querySelector('.modal-close').addEventListener('click', () => {
+    document.getElementById('action-menu-btn').focus();
+  });
+
+  // Keyboard: Escape closes, Tab stays inside the modal.
+  modal.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAiModal();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    const focusable = [...modal.querySelectorAll('button, input, select')]
+      .filter(el => !el.disabled && el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last  = focusable[focusable.length - 1];
+
+    if (e.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+}
+
+// ============================================================
+// PLAYLIST SONGS MODAL
+// ============================================================
+
+// The playlists currently shown as cards (card data-index points into this).
+let loadedPlaylists = [];
+// Bumped on every open and close, so a slow reply for an earlier card
+// (or a closed modal) is ignored instead of overwriting the current view.
+let tracksRequestId = 0;
+let tracksReturnFocus = null;
+
+function setTracksLoading(loading) {
+  document.getElementById('tracks-status').classList.toggle('hidden', !loading);
+  document.getElementById('tracks-status-text').textContent = loading ? 'Loading songs...' : '';
+}
+
+function showTracksError(msg) {
+  setTracksLoading(false);
+  document.getElementById('tracks-body').innerHTML =
+    `<p class="modal-error" role="alert">${escapeHtml(msg)}</p>`;
+}
+
+function renderTrackSection(label, section) {
+  let count = '';
+  if (section.status === 'ok') {
+    const n = section.songs.length;
+    count = ` · ${n} song${n === 1 ? '' : 's'}`;
+  }
+  let html = `<h3 class="field-label tracks-heading">${label}${count}</h3>`;
+
+  if (section.status === 'auth_expired') {
+    html += `<p class="modal-error" role="alert">${escapeHtml(
+      section.message || `Your ${label} login has expired. Please log out and sign in again.`
+    )}</p>`;
+    return `<section class="tracks-section">${html}</section>`;
+  }
+  if (section.status !== 'ok') {
+    html += `<p class="modal-error" role="alert">${escapeHtml(
+      section.message || `Couldn't load songs from ${label}. Please try again.`
+    )}</p>`;
+    return `<section class="tracks-section">${html}</section>`;
+  }
+
+  if (!section.songs.length) {
+    html += `<p class="tracks-note">This playlist has no songs on ${label}.</p>`;
+  } else {
+    html += '<ol class="tracks-list">' + section.songs.map(s =>
+      s.artist
+        ? `<li>${escapeHtml(s.title)} - ${escapeHtml(s.artist)}</li>`
+        : `<li>${escapeHtml(s.title)}</li>`
+    ).join('') + '</ol>';
+  }
+  if (section.hidden) {
+    html += `<p class="tracks-note">${section.hidden} unavailable video${section.hidden === 1 ? '' : 's'} (deleted or private) not shown.</p>`;
+  }
+  if (section.truncated) {
+    html += `<p class="tracks-note">Showing the first ${section.songs.length} songs.</p>`;
+  }
+  return `<section class="tracks-section">${html}</section>`;
+}
+
+async function openTracksModal(card) {
+  const pl = loadedPlaylists[Number(card.dataset.index)];
+  if (!pl) return;
+
+  const requestId = ++tracksRequestId;
+  tracksReturnFocus = card;
+
+  document.getElementById('modal-tracks-title').textContent = pl.name;
+  document.getElementById('tracks-body').innerHTML = '';
+  setTracksLoading(true);
+  openModal('modal-tracks');
+  document.getElementById('modal-tracks-title').focus();
+
+  const query = `name=${encodeURIComponent(pl.name)}&user_id=${encodeURIComponent(getUserId())}`;
+  let res;
+  let data = null;
+  try {
+    res = await fetch(`${BASE_URL}/playlist_tracks?${query}`);
+    try {
+      data = await res.json();
+    } catch {
+      data = null;
+    }
+  } catch {
+    if (requestId !== tracksRequestId) return;
+    showTracksError('Could not connect to the server. Please try again.');
+    return;
+  }
+  if (requestId !== tracksRequestId) return;
+
+  if (res.status === 401) {
+    showTracksError('Your login has expired. Please log out and sign in again.');
+    return;
+  }
+  if (!res.ok || !data) {
+    showTracksError(
+      (data && typeof data.detail === 'string') ? data.detail : 'Couldn\'t load the songs. Please try again.'
+    );
+    return;
+  }
+
+  let html = '';
+  if (data.spotify) html += renderTrackSection('Spotify', data.spotify);
+  if (data.youtube) html += renderTrackSection('YouTube', data.youtube);
+  setTracksLoading(false);
+  document.getElementById('tracks-body').innerHTML =
+    html || '<p class="tracks-note">This playlist isn\'t linked to Spotify or YouTube.</p>';
+}
+
+function closeTracksModal() {
+  tracksRequestId++;
+  closeModal('modal-tracks');
+  // The grid may have re-rendered while the modal was open.
+  if (tracksReturnFocus && tracksReturnFocus.isConnected) tracksReturnFocus.focus();
+  tracksReturnFocus = null;
+}
+
+function initTracksModal() {
+  const grid  = document.getElementById('playlist-grid');
+  const modal = document.getElementById('modal-tracks');
+
+  grid.addEventListener('click', (e) => {
+    // Leave clicks on any control inside a card to that control.
+    if (e.target.closest('button, a, input, select, textarea, label')) return;
+    const card = e.target.closest('.playlist-card');
+    if (card) openTracksModal(card);
+  });
+
+  grid.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    // Only when the card itself has focus, not a control inside it.
+    if (!e.target.classList.contains('playlist-card')) return;
+    e.preventDefault();
+    openTracksModal(e.target);
+  });
+
+  // initModals() already hides the modal on X / backdrop click; these
+  // also cancel the pending request and return focus to the card.
+  modal.querySelector('.modal-close').addEventListener('click', closeTracksModal);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeTracksModal();
+  });
+
+  // Listen on the document so Escape works even after a click inside the
+  // modal has moved focus to <body>.
+  document.addEventListener('keydown', (e) => {
+    if (modal.classList.contains('hidden')) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeTracksModal();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    // Keep Tab inside the modal (close button <-> song list).
+    const focusable = [...modal.querySelectorAll('button, [tabindex="0"]')]
+      .filter(el => el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last  = focusable[focusable.length - 1];
+    const inside = modal.contains(document.activeElement);
+
+    if (e.shiftKey && (!inside || document.activeElement === first)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (!inside || document.activeElement === last)) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+}
+
+// ============================================================
 // DASHBOARD INITIALIZATION
 // ============================================================
 
@@ -487,6 +860,8 @@ function init() {
   initLandingPage();
   initActionMenu();
   initModals();
+  initAiGenerator();
+  initTracksModal();
   initDashboard();
 
   // Check if the backend redirected back here after OAuth with a user_id param.

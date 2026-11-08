@@ -32,7 +32,7 @@
             <li role="none"><button class="menu-item" id="btn-copy-playlist"   role="menuitem">Copy Playlist</button></li>
             <li role="none"><button class="menu-item" id="btn-sync-playlist"   role="menuitem">Sync Playlist</button></li>
             <li role="none"><button class="menu-item" id="btn-delete-playlist" role="menuitem">Delete Playlist</button></li>
-            <!-- FUTURE: Generate with AI -->
+            <li role="none"><button class="menu-item" id="btn-generate-ai"     role="menuitem">Generate with AI</button></li>
             <li class="menu-separator" role="separator"></li>
             <li role="none"><button class="menu-item menu-item-danger" id="btn-delete-account" role="menuitem">Delete Account</button></li>
             <li role="none"><button class="menu-item menu-item-danger" id="btn-logout"          role="menuitem">Logout</button></li>
@@ -135,6 +135,59 @@
       </select>
       <div class="modal-error hidden"></div>
       <button class="btn btn-danger btn-full modal-action-btn" data-modal="modal-delete">Delete</button>
+    </div>
+  </div>
+
+  <!-- ===== MODAL: GENERATE WITH AI ===== -->
+  <div id="modal-ai" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-ai-title">
+    <div class="modal-card">
+      <button class="modal-close" aria-label="Close">&times;</button>
+      <h2 id="modal-ai-title" class="modal-title">Generate with AI</h2>
+
+      <form id="ai-form" class="modal-section" novalidate>
+        <label class="field-label" for="ai-name">Playlist Name</label>
+        <input type="text" id="ai-name" class="input-field" placeholder="Workout Mix" autocomplete="off" />
+        <label class="field-label" for="ai-prompt">Describe the Music</label>
+        <input type="text" id="ai-prompt" class="input-field" placeholder="pumped up workout music" maxlength="300" autocomplete="off" aria-describedby="ai-prompt-note" />
+        <p id="ai-prompt-note" class="field-note">Up to about 20 real songs. Songs that can't be found are skipped. There's a daily limit on AI playlists.</p>
+        <label class="field-label" for="ai-platform">Platform</label>
+        <select id="ai-platform" class="select-field" aria-describedby="ai-platform-note">
+          <option value="both" selected>Both</option>
+          <option value="spotify">Spotify</option>
+          <option value="youtube">YouTube</option>
+        </select>
+        <p id="ai-platform-note" class="field-note">Both keeps the two playlists synced and only adds songs found on both.</p>
+        <p id="ai-status" class="ai-status hidden" role="status" aria-live="polite" tabindex="-1">
+          <span class="ai-spinner" aria-hidden="true"></span>
+          <span>Generating... this can take a minute.</span>
+          <span id="ai-elapsed" class="ai-elapsed" aria-hidden="true"></span>
+        </p>
+        <div class="modal-error hidden" role="alert"></div>
+        <button type="submit" class="btn btn-primary btn-full modal-action-btn" id="btn-ai-submit">Generate</button>
+      </form>
+
+      <div id="ai-result" class="modal-section hidden">
+        <p id="ai-result-summary" class="ai-result-summary" tabindex="-1"></p>
+        <p id="ai-result-note" class="field-note"></p>
+        <div id="ai-skipped-wrap" class="modal-section hidden">
+          <h3 id="ai-skipped-title" class="field-label"></h3>
+          <ul id="ai-skipped-list" class="ai-skipped-list" aria-labelledby="ai-skipped-title"></ul>
+        </div>
+        <button type="button" class="btn btn-primary btn-full" id="btn-ai-done">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== MODAL: PLAYLIST SONGS ===== -->
+  <div id="modal-tracks" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-tracks-title">
+    <div class="modal-card tracks-card">
+      <button class="modal-close" aria-label="Close">&times;</button>
+      <h2 id="modal-tracks-title" class="modal-title" tabindex="-1">Songs</h2>
+      <p id="tracks-status" class="ai-status" role="status" aria-live="polite">
+        <span class="ai-spinner" aria-hidden="true"></span>
+        <span id="tracks-status-text">Loading songs...</span>
+      </p>
+      <div id="tracks-body" class="tracks-body" tabindex="0" aria-label="Songs in this playlist"></div>
     </div>
   </div>
 
