@@ -1,4 +1,4 @@
-import os, psycopg2, json, base64, re, uuid, html, hmac
+import os, psycopg2, json, base64, re, uuid, html, hmac, unicodedata
 import requests
 import anthropic
 import autosync
@@ -1536,9 +1536,21 @@ def normalize_song_text(text: str):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def fold_accents(text: str):
+    # "JAŸ-Z" -> "JAY-Z", "Beyoncé" -> "Beyonce". NFKD splits a letter from its
+    # accent; then the accent marks are dropped. Used only for comparing, not
+    # for song_cache keys (normalize_song_text is unchanged).
+    decomposed = unicodedata.normalize("NFKD", html.unescape(text or ""))
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def match_key(text: str):
+    return normalize_song_text(fold_accents(text))
+
+
 def loose_match(wanted: str, found: str):
-    a = normalize_song_text(wanted)
-    b = normalize_song_text(found)
+    a = match_key(wanted)
+    b = match_key(found)
     if not a or not b:
         return False
     # Pad with spaces so "go" doesn't match inside "gold digger".
@@ -1651,10 +1663,31 @@ def is_official_channel(channel: str, artist: str):
     if "vevo" in channel.lower():
         return True
     # "Eminem", "EminemMusic", "Survivor Official" all count as the artist's channel.
-    compact_channel = re.sub(r"[^\w]", "", normalize_song_text(channel))
-    compact_artist = re.sub(r"[^\w]", "", normalize_song_text(artist))
+    compact_channel = re.sub(r"[^\w]", "", match_key(channel))
+    compact_artist = re.sub(r"[^\w]", "", match_key(artist))
     compact_channel = re.sub(r"(official|music|tv)+$", "", compact_channel)
     return bool(compact_artist) and compact_channel == compact_artist
+
+
+# "Jay-Z & Kanye West", "A, B and C", "A x B", "A feat. B" -> each name.
+CREDIT_SEPARATORS = re.compile(
+    r"\s*(?:&|,|\+|\s+x\s+|\band\b|\bwith\b|\bvs\.?|\bfeat\.?|\bft\.?|\bfeaturing\b)\s*",
+    re.IGNORECASE,
+)
+
+
+def credited_artists(artist_field: str):
+    return [a.strip() for a in CREDIT_SEPARATORS.split(artist_field or "") if a.strip()]
+
+
+def is_collab_official(channel: str, artist: str, credited: str):
+    # A collaboration uploaded by a co-artist's official channel, e.g.
+    # "Jay-Z & Kanye West - ..." on Kanye West's channel, for a Jay-Z song.
+    # Only used to prefer among results that already passed song_matches.
+    credits = credited_artists(credited)
+    if len(credits) < 2 or not any(loose_match(artist, c) for c in credits):
+        return False
+    return any(is_official_channel(channel, c) for c in credits)
 
 
 def pick_youtube_result(song: dict, items: list):
@@ -1671,7 +1704,9 @@ def pick_youtube_result(song: dict, items: list):
         parsed = parse_youtube_title(raw_title, channel)
         if not song_matches(song, parsed["title"], [parsed["artist"], channel]):
             continue
-        if is_official_channel(channel, song["artist"]):
+        if is_official_channel(channel, song["artist"]) or is_collab_official(
+            channel, song["artist"], parsed["artist"]
+        ):
             return video_id, None
         if not fallback:
             fallback = video_id
