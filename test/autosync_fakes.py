@@ -16,9 +16,20 @@ class FakeStore:
         self.snapshots = {}
         self.unmatched = set()
 
-    def next_run_count(self):
+    lease = None          # run_id holding the lease, or None
+    released = []         # summaries passed to release_lease
+
+    def acquire_lease(self, run_id):
+        if self.lease is not None:
+            return None
+        self.lease = run_id
         self.run_count += 1
         return self.run_count
+
+    def release_lease(self, run_id, summary):
+        if self.lease == run_id:
+            self.lease = None
+        self.released = self.released + [summary]
 
     def load_pairs(self, limit, pair_id=None):
         rows = [dict(p, state=self.states.get(p["id"])) for p in self.pairs if not pair_id or p["id"] == pair_id]

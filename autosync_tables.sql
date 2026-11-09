@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
     pair_id                       uuid        PRIMARY KEY REFERENCES playlists(id) ON DELETE CASCADE,
     spotify_snapshot_id           text,
     youtube_etag                  text,
+    youtube_item_count            integer,                             -- etag covers only the first 50
     pending                       boolean     NOT NULL DEFAULT true,   -- a change was seen and not synced yet
     last_change_seen_at           timestamptz,
     quiet_runs                    integer     NOT NULL DEFAULT 0,      -- runs in a row with no new change

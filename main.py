@@ -1,9 +1,11 @@
-import os, psycopg2, json, base64, re, uuid, html
+import os, psycopg2, json, base64, re, uuid, html, hmac
 import requests
 import anthropic
+import autosync
 from contextlib import contextmanager
 from enum import Enum
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, constr
@@ -1910,6 +1912,24 @@ def generate_playlist(data: Generate_Playlist_Input):
         "total": len(songs),
         "synced": data.platform == Platform.BOTH,
     }
+
+
+# ============================================================
+# AUTO-SYNC TRIGGER (called by cron-job.org every 2 minutes)
+# ============================================================
+
+@app.post("/internal/run-sync")
+def internal_run_sync(x_sync_secret: Optional[str] = Header(default=None)):
+    # Fail closed: no SYNC_SECRET configured means nobody gets in.
+    expected = os.getenv("SYNC_SECRET") or ""
+    provided = x_sync_secret or ""
+    if not expected or not provided or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Returns {"status": "busy"} right away if another run holds the lease.
+    # SYNC_DRY_RUN defaults to true; there is no real write code yet.
+    return autosync.run_once()
 
 
 @app.get("/")

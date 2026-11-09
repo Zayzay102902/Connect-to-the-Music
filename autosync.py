@@ -10,9 +10,11 @@ Track shapes used here:
   Snapshot pair: {"spotify_track_id", "youtube_video_id"}
 """
 
+import json
 import math
 import os
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -450,6 +452,7 @@ def save_snapshot(conn, pair_id, pairs):
 # SETTLE CHECK (pure)
 # ============================================================
 
+LEASE_MINUTES = 5            # a run's lease expires after this (crash safety)
 SETTLE_QUIET_RUNS = 2        # runs in a row with no new change before syncing
 BACKSTOP_MINUTES = 15        # full re-check for YouTube playlists > 50 items
 ERROR_BACKOFF_MINUTES = 10   # after a failed sync, wait before retrying
@@ -581,10 +584,45 @@ class DbStore:
         finally:
             cur.close()
 
-    def next_run_count(self):
-        row = self._one("UPDATE sync_runner SET run_count = run_count + 1 WHERE id = 1 RETURNING run_count")
-        self.conn.commit()
-        return row[0]
+    def acquire_lease(self, run_id):
+        """Atomically claim the single runner lease and bump the run counter.
+        Returns the new run_count, or None if another run holds a live lease.
+        One UPDATE, so it's safe through Neon's PgBouncer pooler (unlike
+        session advisory locks). A crashed run's lease expires after
+        LEASE_MINUTES."""
+        try:
+            row = self._one(
+                """UPDATE sync_runner
+                   SET run_id = %s, running_since = now(), run_count = run_count + 1
+                   WHERE id = 1
+                     AND (running_since IS NULL OR running_since < now() - make_interval(mins => %s))
+                   RETURNING run_count""",
+                (run_id, LEASE_MINUTES),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return row[0] if row else None
+
+    def release_lease(self, run_id, summary):
+        """Release only our own lease, so a run that overran its lease can't
+        clear a newer run's."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """UPDATE sync_runner
+                   SET run_id = NULL, running_since = NULL,
+                       last_run_finished_at = now(), last_run_summary = %s
+                   WHERE id = 1 AND run_id = %s""",
+                (json.dumps(summary, default=str), run_id),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     def load_pairs(self, limit, pair_id=None):
         """Keep Synced pairs linked on both platforms, least recently checked first."""
@@ -863,7 +901,7 @@ def _utc_now():
 def run_once(dry_run=None, pair_id=None, deps=None, store=None, log=print,
              now=None, clock=time.monotonic):
     """One pass: check every pair cheaply, sync the ones that have settled.
-    No overlap lease yet (Stage 4)."""
+    Returns {"status": "busy"} at once if another run holds the lease."""
     if dry_run is None:
         dry_run = is_dry_run()
     if not dry_run:
@@ -873,11 +911,28 @@ def run_once(dry_run=None, pair_id=None, deps=None, store=None, log=print,
     if store is None:
         with sync_db_conn() as conn:
             return run_once(dry_run, pair_id, deps, DbStore(conn), log, now, clock)
-    deps = deps or MainDeps()
 
+    run_id = str(uuid.uuid4())
+    run_count = store.acquire_lease(run_id)
+    if run_count is None:
+        log("auto-sync: another run holds the lease; exiting.")
+        return {"status": "busy"}
+
+    summary = {"status": "error", "run": run_count}
+    try:
+        summary = _run_with_lease(run_count, dry_run, pair_id, deps or MainDeps(), store, log, now, clock)
+        return summary
+    finally:
+        try:
+            store.release_lease(run_id, summary)
+        except Exception as e:
+            # The lease will expire on its own after LEASE_MINUTES.
+            log(f"auto-sync: couldn't release lease: {type(e).__name__}: {e}")
+
+
+def _run_with_lease(run_count, dry_run, pair_id, deps, store, log, now, clock):
     started = clock()
     budget = Budget(started + time_budget_seconds(), max_yt_searches(), clock)
-    run_count = store.next_run_count()
     check_youtube = run_count % 2 == 0
     pairs = store.load_pairs(max_checks(), pair_id)
     log(f"auto-sync run #{run_count}: {len(pairs)} pair(s), dry_run={dry_run}, "
@@ -930,6 +985,6 @@ def run_once(dry_run=None, pair_id=None, deps=None, store=None, log=print,
     log(f"auto-sync run #{run_count} done in {elapsed:.1f}s, {syncs} sync(s). "
         f"YouTube quota (est.): {budget.yt_units} units "
         f"({budget.yt_checks} etag checks, {budget.yt_searches} searches x {YT_COST_SEARCH}, list calls)")
-    return {"run": run_count, "dry_run": dry_run, "check_youtube": check_youtube,
+    return {"status": "ok", "run": run_count, "dry_run": dry_run, "check_youtube": check_youtube,
             "pairs": results, "yt_units": budget.yt_units, "seconds": round(elapsed, 1)}
 

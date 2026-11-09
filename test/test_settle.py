@@ -186,6 +186,40 @@ def test_first_seen_on_spotify_only_run_does_not_count_youtube_as_change_later()
     assert d == "wait" and st["quiet_runs"] == 1 and "quiet 1/2" in reason
 
 
+# ---------------- lease (Stage 4) ----------------
+
+def test_busy_when_another_run_holds_the_lease_and_nothing_is_checked():
+    sim = Sim()
+    sim.store.lease = "someone-else"
+    r = sim.run()
+    assert r == {"status": "busy"}
+    assert sim.world.calls["sp_marker"] == 0
+    assert sim.store.run_count == 0          # counter not bumped
+    assert sim.store.lease == "someone-else"  # their lease untouched
+
+
+def test_lease_is_released_after_a_normal_run():
+    sim = Sim()
+    r = sim.run()
+    assert r["status"] == "ok"
+    assert sim.store.lease is None
+    assert sim.store.released[-1]["run"] == 1
+
+
+def test_lease_is_released_even_if_the_run_crashes():
+    import pytest
+    sim = Sim()
+
+    def boom(*a, **k):
+        raise RuntimeError("db went away")
+
+    sim.store.load_pairs = boom
+    with pytest.raises(RuntimeError):
+        sim.run()
+    assert sim.store.lease is None
+    assert sim.store.released[-1]["status"] == "error"
+
+
 def test_dry_run_still_required():
     import pytest
     with pytest.raises(RuntimeError):
