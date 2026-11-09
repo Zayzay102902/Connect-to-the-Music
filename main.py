@@ -1,9 +1,11 @@
-import os, psycopg2, json, base64, re, uuid, html
+import os, psycopg2, json, base64, re, uuid, html, hmac, unicodedata
 import requests
 import anthropic
+import autosync
 from contextlib import contextmanager
 from enum import Enum
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, constr
@@ -147,8 +149,9 @@ def get_spotify_songs(sp_id: str, sp_access_token: str):
     return songs
 
 
-def get_valid_youtube_token(user_id: str):
-    with get_db_conn() as conn:
+def get_valid_youtube_token(user_id: str, get_conn=None):
+    # get_conn lets auto-sync use its own connection (see autosync.resolve_database_url).
+    with (get_conn or get_db_conn)() as conn:
         cur = conn.cursor()
         try:
             cur.execute(
@@ -197,8 +200,9 @@ def get_valid_youtube_token(user_id: str):
             cur.close()
 
 
-def get_valid_spotify_token(user_id: str) -> str:
-    with get_db_conn() as conn:
+def get_valid_spotify_token(user_id: str, get_conn=None) -> str:
+    # get_conn lets auto-sync use its own connection (see autosync.resolve_database_url).
+    with (get_conn or get_db_conn)() as conn:
         cur = conn.cursor()
         try:
             cur.execute(
@@ -1150,9 +1154,14 @@ def youtube_display_song(raw_title: str, channel_title: str):
     return {"title": raw_title, "artist": None}
 
 
-def fetch_youtube_tracks(yt_id: str, yt_access_token: str):
+def fetch_youtube_tracks(yt_id: str, yt_access_token: str, include_ids: bool = False):
+    # include_ids=True is for auto-sync: each song also gets video_id and
+    # item_id (the playlistItem id needed to remove it), and the video ids of
+    # deleted/private placeholders come back in "unavailable" so they aren't
+    # mistaken for removals. With the default False the output is unchanged.
     songs = []
     hidden = 0
+    unavailable = []
     page_token = None
     for _ in range(TRACKS_MAX_PAGES):
         params = {"part": "snippet", "playlistId": yt_id, "maxResults": 50}
@@ -1171,21 +1180,37 @@ def fetch_youtube_tracks(yt_id: str, yt_access_token: str):
             snippet = item.get("snippet", {})
             title = snippet.get("title", "")
             channel = snippet.get("videoOwnerChannelTitle")
+            video_id = (snippet.get("resourceId") or {}).get("videoId")
             if not channel and title in YOUTUBE_UNAVAILABLE_TITLES:
                 hidden += 1
+                if include_ids and video_id:
+                    unavailable.append(video_id)
                 continue
             if not title:
+                if include_ids and video_id:
+                    unavailable.append(video_id)
                 continue
-            songs.append(youtube_display_song(title, channel))
+            song = youtube_display_song(title, channel)
+            if include_ids:
+                song["video_id"] = video_id
+                song["item_id"] = item.get("id")
+            songs.append(song)
 
         page_token = data.get("nextPageToken")
         if not page_token:
             break
 
-    return {"songs": songs, "hidden": hidden, "truncated": bool(page_token)}
+    result = {"songs": songs, "hidden": hidden, "truncated": bool(page_token)}
+    if include_ids:
+        result["unavailable"] = unavailable
+    return result
 
 
-def fetch_spotify_tracks(sp_id: str, sp_access_token: str):
+def fetch_spotify_tracks(sp_id: str, sp_access_token: str, include_ids: bool = False):
+    # include_ids=True is for auto-sync: each song also gets track_id, uri and
+    # match_artist (the first artist, for searching). track_id is None for
+    # local files and podcast episodes, which auto-sync leaves alone.
+    # With the default False the output is unchanged.
     songs = []
     url = f"https://api.spotify.com/v1/playlists/{sp_id}/items"
     params = {"limit": 50}
@@ -1208,7 +1233,13 @@ def fetch_spotify_tracks(sp_id: str, sp_access_token: str):
             # Podcast episodes have no artists; show the show's name instead.
             if not artists and (track.get("show") or {}).get("name"):
                 artists = [track["show"]["name"]]
-            songs.append({"title": name, "artist": ", ".join(artists) or None})
+            song = {"title": name, "artist": ", ".join(artists) or None}
+            if include_ids:
+                is_track = track.get("type", "track") == "track" and not track.get("is_local")
+                song["track_id"] = track.get("id") if is_track else None
+                song["uri"] = track.get("uri")
+                song["match_artist"] = artists[0] if artists and is_track else None
+            songs.append(song)
 
         # "next" is a full URL that already carries offset and limit.
         url = data.get("next")
@@ -1505,9 +1536,21 @@ def normalize_song_text(text: str):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def fold_accents(text: str):
+    # "JAŸ-Z" -> "JAY-Z", "Beyoncé" -> "Beyonce". NFKD splits a letter from its
+    # accent; then the accent marks are dropped. Used only for comparing, not
+    # for song_cache keys (normalize_song_text is unchanged).
+    decomposed = unicodedata.normalize("NFKD", html.unescape(text or ""))
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def match_key(text: str):
+    return normalize_song_text(fold_accents(text))
+
+
 def loose_match(wanted: str, found: str):
-    a = normalize_song_text(wanted)
-    b = normalize_song_text(found)
+    a = match_key(wanted)
+    b = match_key(found)
     if not a or not b:
         return False
     # Pad with spaces so "go" doesn't match inside "gold digger".
@@ -1620,10 +1663,31 @@ def is_official_channel(channel: str, artist: str):
     if "vevo" in channel.lower():
         return True
     # "Eminem", "EminemMusic", "Survivor Official" all count as the artist's channel.
-    compact_channel = re.sub(r"[^\w]", "", normalize_song_text(channel))
-    compact_artist = re.sub(r"[^\w]", "", normalize_song_text(artist))
+    compact_channel = re.sub(r"[^\w]", "", match_key(channel))
+    compact_artist = re.sub(r"[^\w]", "", match_key(artist))
     compact_channel = re.sub(r"(official|music|tv)+$", "", compact_channel)
     return bool(compact_artist) and compact_channel == compact_artist
+
+
+# "Jay-Z & Kanye West", "A, B and C", "A x B", "A feat. B" -> each name.
+CREDIT_SEPARATORS = re.compile(
+    r"\s*(?:&|,|\+|\s+x\s+|\band\b|\bwith\b|\bvs\.?|\bfeat\.?|\bft\.?|\bfeaturing\b)\s*",
+    re.IGNORECASE,
+)
+
+
+def credited_artists(artist_field: str):
+    return [a.strip() for a in CREDIT_SEPARATORS.split(artist_field or "") if a.strip()]
+
+
+def is_collab_official(channel: str, artist: str, credited: str):
+    # A collaboration uploaded by a co-artist's official channel, e.g.
+    # "Jay-Z & Kanye West - ..." on Kanye West's channel, for a Jay-Z song.
+    # Only used to prefer among results that already passed song_matches.
+    credits = credited_artists(credited)
+    if len(credits) < 2 or not any(loose_match(artist, c) for c in credits):
+        return False
+    return any(is_official_channel(channel, c) for c in credits)
 
 
 def pick_youtube_result(song: dict, items: list):
@@ -1640,7 +1704,9 @@ def pick_youtube_result(song: dict, items: list):
         parsed = parse_youtube_title(raw_title, channel)
         if not song_matches(song, parsed["title"], [parsed["artist"], channel]):
             continue
-        if is_official_channel(channel, song["artist"]):
+        if is_official_channel(channel, song["artist"]) or is_collab_official(
+            channel, song["artist"], parsed["artist"]
+        ):
             return video_id, None
         if not fallback:
             fallback = video_id
@@ -1881,6 +1947,24 @@ def generate_playlist(data: Generate_Playlist_Input):
         "total": len(songs),
         "synced": data.platform == Platform.BOTH,
     }
+
+
+# ============================================================
+# AUTO-SYNC TRIGGER (called by cron-job.org every 2 minutes)
+# ============================================================
+
+@app.post("/internal/run-sync")
+def internal_run_sync(x_sync_secret: Optional[str] = Header(default=None)):
+    # Fail closed: no SYNC_SECRET configured means nobody gets in.
+    expected = os.getenv("SYNC_SECRET") or ""
+    provided = x_sync_secret or ""
+    if not expected or not provided or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Returns {"status": "busy"} right away if another run holds the lease.
+    # SYNC_DRY_RUN defaults to true; there is no real write code yet.
+    return autosync.run_once()
 
 
 @app.get("/")
