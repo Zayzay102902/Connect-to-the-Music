@@ -10,10 +10,20 @@ Track shapes used here:
   Snapshot pair: {"spotify_track_id", "youtube_video_id"}
 """
 
+import math
 import os
+import time
+from contextlib import contextmanager
+from pathlib import Path
 
 SPOTIFY = "spotify"
 YOUTUBE = "youtube"
+
+# Estimated YouTube Data API cost per call (units).
+YT_COST_LIST = 1
+YT_COST_SEARCH = 100
+YT_COST_INSERT = 50
+YT_COST_DELETE = 50
 
 
 # ============================================================
@@ -35,6 +45,64 @@ def is_dry_run():
 
 def max_removals():
     return env_int("SYNC_MAX_REMOVALS", 10)
+
+
+def max_pairs():
+    return env_int("SYNC_MAX_PAIRS", 5)
+
+
+def time_budget_seconds():
+    return env_int("SYNC_TIME_BUDGET_SECONDS", 20)
+
+
+def max_yt_searches():
+    return env_int("SYNC_MAX_YT_SEARCHES", 5)
+
+
+# ============================================================
+# DATABASE (the runner's own connection)
+# ============================================================
+
+def resolve_database_url():
+    """A .env file next to this module wins over the process environment.
+
+    Locally, Windows has a DATABASE_URL pointing at localhost that
+    load_dotenv() won't override, so read .env directly. On Render there's
+    no .env (it's gitignored), so the real environment variable is used.
+    """
+    env_file = Path(__file__).resolve().with_name(".env")
+    if env_file.is_file():
+        from dotenv import dotenv_values
+
+        url = dotenv_values(env_file).get("DATABASE_URL")
+        if url:
+            return url
+    return os.getenv("DATABASE_URL")
+
+
+_sync_pool = None
+
+
+def _get_sync_pool():
+    global _sync_pool
+    if _sync_pool is None:
+        from psycopg2 import pool as pg_pool
+
+        _sync_pool = pg_pool.SimpleConnectionPool(1, 3, resolve_database_url())
+    return _sync_pool
+
+
+@contextmanager
+def sync_db_conn():
+    p = _get_sync_pool()
+    conn = p.getconn()
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        p.putconn(conn)
 
 
 # ============================================================
@@ -71,6 +139,17 @@ def _song(item):
     return {"title": item.get("title"), "artist": item.get("artist")}
 
 
+def _norm(text):
+    return " ".join((text or "").lower().split())
+
+
+def default_same_song(a, b):
+    """Strict fallback used by tests. The runner passes main.song_matches instead."""
+    return bool(a.get("title") and a.get("artist")) and (
+        _norm(a["title"]) == _norm(b.get("title")) and _norm(a["artist"]) == _norm(b.get("artist"))
+    )
+
+
 def plan_sync(
     snapshot,
     sp_tracks,
@@ -79,6 +158,7 @@ def plan_sync(
     match_fn,
     recently_unmatched=frozenset(),
     removal_cap=None,
+    same_song=None,
 ):
     """Work out what to change on each side. Makes no changes itself.
 
@@ -87,6 +167,11 @@ def plan_sync(
 
     recently_unmatched: set of (platform, source_id) that failed to match
     recently. They are skipped without searching.
+
+    same_song(a, b) -> bool says whether two {title, artist} dicts are the
+    same song. Before searching for a new song, we look for it among the
+    other playlist's unpaired items, so a song that's already there (maybe
+    as a different upload than search would pick) is paired, not duplicated.
 
     Returns a dict:
       status        "ok" or "skipped_removal_cap"
@@ -148,13 +233,37 @@ def plan_sync(
     def paired_yt():
         return {p["youtube_video_id"] for p in kept + new_pairs}
 
+    same_song = same_song or default_same_song
+
+    def find_local(song, by_id, snap_ids, paired, remove_candidates):
+        # Unpaired items on the other side: new since last sync, or about to
+        # be removed (a version swap). Already-paired items are never reused.
+        for other_id, item in by_id.items():
+            if other_id in paired:
+                continue
+            if other_id in snap_ids and other_id not in remove_candidates:
+                continue
+            try:
+                if same_song(song, _song(item)):
+                    return other_id
+            except Exception:
+                continue
+        return None
+
     # --- 2. Songs added on Spotify -> find them on YouTube ---
     for s, track in sp_by_id.items():
         if s in snap_sp or s in paired_sp():
             continue
+        song = _song(track)
+        local_y = None
+        if song["title"] and song["artist"]:
+            local_y = find_local(song, yt_by_id, snap_yt, paired_yt(), remove_yt_candidates)
+        if local_y:
+            remove_yt_candidates.pop(local_y, None)
+            new_pairs.append({"spotify_track_id": s, "youtube_video_id": local_y})
+            continue
         if (SPOTIFY, s) in recently_unmatched:
             continue
-        song = _song(track)
         if not song["title"] or not song["artist"]:
             unmatched.append({"platform": SPOTIFY, "source_id": s, **song, "reason": "missing title or artist"})
             continue
@@ -180,9 +289,16 @@ def plan_sync(
     for y, video in yt_by_id.items():
         if y in snap_yt or y in paired_yt():
             continue
+        song = _song(video)
+        local_s = None
+        if song["title"] and song["artist"]:
+            local_s = find_local(song, sp_by_id, snap_sp, paired_sp(), remove_sp_candidates)
+        if local_s:
+            remove_sp_candidates.pop(local_s, None)
+            new_pairs.append({"spotify_track_id": local_s, "youtube_video_id": y})
+            continue
         if (YOUTUBE, y) in recently_unmatched:
             continue
-        song = _song(video)
         if not song["title"] or not song["artist"]:
             unmatched.append({"platform": YOUTUBE, "source_id": y, **song, "reason": "couldn't read an artist from the video title"})
             continue
@@ -262,19 +378,36 @@ def _dedupe_pairs(pairs):
     return out
 
 
-def describe_plan(pair_label: str, plan: dict):
-    """One readable log block for dry-run output."""
+def describe_plan(pair_label: str, plan: dict, names=None):
+    """Readable log block for dry-run output. names: id -> "'Title' by Artist"."""
+    names = names or {}
+
+    def n(i):
+        return f"{names.get(i, '?')} [{i}]"
+
     if plan["status"] == "skipped_removal_cap":
         return (
             f"[{pair_label}] SKIPPED: would remove {plan['would_remove']} songs "
-            f"(cap {max_removals()}). Playlist left alone."
+            f"(cap {max_removals()}). Playlist left alone, snapshot kept."
         )
-    lines = [f"[{pair_label}] {'first sync' if plan['first_sync'] else 'sync'}:"]
-    lines.append(f"  Spotify +{len(plan['spotify_add'])} -{len(plan['spotify_remove'])}  {plan['spotify_add']} {[r['track_id'] for r in plan['spotify_remove']]}")
-    lines.append(f"  YouTube +{len(plan['yt_add'])} -{len(plan['yt_remove'])}  {plan['yt_add']} {[r['video_id'] for r in plan['yt_remove']]}")
-    lines.append(f"  snapshot -> {len(plan['new_snapshot'])} pairs; unmatched {len(plan['unmatched'])}; deferred {len(plan['deferred'])}")
+    lines = [f"[{pair_label}] plan ({'first sync: adds only' if plan['first_sync'] else 'sync'}):"]
+    for s in plan["spotify_add"]:
+        lines.append(f"  + Spotify  {n(s)}")
+    for r in plan["spotify_remove"]:
+        lines.append(f"  - Spotify  {n(r['track_id'])}")
+    for y in plan["yt_add"]:
+        lines.append(f"  + YouTube  {n(y)}")
+    for r in plan["yt_remove"]:
+        lines.append(f"  - YouTube  {n(r['video_id'])} (item {r['item_id']})")
     for u in plan["unmatched"]:
-        lines.append(f"    unmatched {u['platform']} {u['source_id']} '{u['title']}' by {u['artist']}: {u['reason']}")
+        lines.append(f"  ? no match for {u['platform']} '{u['title']}' by {u['artist']} [{u['source_id']}]: {u['reason']}")
+    for d in plan["deferred"]:
+        lines.append(f"  … deferred {d['platform']} '{d['title']}' by {d['artist']} [{d['source_id']}] (search budget)")
+    lines.append(
+        f"  totals: Spotify +{len(plan['spotify_add'])} -{len(plan['spotify_remove'])}, "
+        f"YouTube +{len(plan['yt_add'])} -{len(plan['yt_remove'])}, "
+        f"snapshot would be {len(plan['new_snapshot'])} pairs"
+    )
     return "\n".join(lines)
 
 
@@ -310,3 +443,220 @@ def save_snapshot(conn, pair_id, pairs):
         raise
     finally:
         cur.close()
+
+
+def load_recently_unmatched(conn, pair_id, hours=24):
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT source_platform, source_id FROM sync_unmatched
+               WHERE pair_id = %s AND last_tried_at > now() - make_interval(hours => %s)""",
+            (pair_id, hours),
+        )
+        return {(r[0], r[1]) for r in cur.fetchall()}
+    finally:
+        cur.close()
+
+
+def load_pairs(conn, limit, pair_id=None):
+    """Keep Synced playlists that are linked on both platforms."""
+    cur = conn.cursor()
+    try:
+        sql = """SELECT id, user_id, playlist_name, spotify_playlist_id, youtube_playlist_id
+                 FROM playlists
+                 WHERE platform = 'both'
+                   AND spotify_playlist_id IS NOT NULL
+                   AND youtube_playlist_id IS NOT NULL"""
+        params = []
+        if pair_id:
+            sql += " AND id = %s"
+            params.append(pair_id)
+        sql += " ORDER BY created_at LIMIT %s"
+        params.append(limit)
+        cur.execute(sql, params)
+        return [
+            {"id": str(r[0]), "user_id": str(r[1]), "name": r[2], "sp_id": r[3], "yt_id": r[4]}
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+
+
+# ============================================================
+# RUNNER
+# ============================================================
+
+class Budget:
+    def __init__(self, deadline, yt_searches):
+        self.deadline = deadline
+        self.yt_searches_left = yt_searches
+        self.yt_units = 0
+        self.yt_searches = 0
+
+    def out_of_time(self):
+        return time.monotonic() >= self.deadline
+
+
+def default_deps():
+    # Imported lazily: main.py will import this module, and this module only
+    # needs main's helpers at run time.
+    import main
+
+    return main
+
+
+def _youtube_list_units(result):
+    if not isinstance(result, dict):
+        return YT_COST_LIST  # a failed call still costs its unit
+    items = len(result.get("songs", [])) + result.get("hidden", 0)
+    return max(1, math.ceil(items / 50)) * YT_COST_LIST
+
+
+def _label(song):
+    return f"'{song.get('title')}' by {song.get('artist') or '?'}"
+
+
+def sync_pair(conn, pair, deps, budget, dry_run, log):
+    """Sync one pair. Returns a small summary dict; errors are logged, not raised."""
+    label = f"{pair['name']} ({pair['id']})"
+    if not dry_run:
+        # Real writes are not implemented yet. Refuse rather than guess.
+        raise RuntimeError("Real writes are not implemented yet; SYNC_DRY_RUN must be true.")
+
+    P = deps.Platform
+    try:
+        sp_token = deps.get_valid_spotify_token(pair["user_id"], get_conn=sync_db_conn)
+        yt_token = deps.get_valid_youtube_token(pair["user_id"], get_conn=sync_db_conn)
+    except Exception as e:
+        detail = getattr(e, "detail", None) or str(e)
+        log(f"[{label}] ERROR getting tokens: {detail}. Skipped.")
+        return {"pair": pair["id"], "status": "error", "error": f"token: {detail}"}
+
+    snapshot = load_snapshot(conn, pair["id"])
+    recently_unmatched = load_recently_unmatched(conn, pair["id"])
+
+    try:
+        sp_result = deps.fetch_spotify_tracks(pair["sp_id"], sp_token, include_ids=True)
+    except Exception as e:
+        sp_result = e
+    try:
+        yt_result = deps.fetch_youtube_tracks(pair["yt_id"], yt_token, include_ids=True)
+    except Exception as e:
+        yt_result = e
+    budget.yt_units += _youtube_list_units(yt_result)
+
+    errors = [
+        err
+        for err in (
+            validate_fetch("Spotify", sp_result, len(snapshot)),
+            validate_fetch("YouTube", yt_result, len(snapshot)),
+        )
+        if err
+    ]
+    if errors:
+        log(f"[{label}] ERROR: {'; '.join(errors)}. Skipped this run.")
+        return {"pair": pair["id"], "status": "error", "error": "; ".join(errors)}
+
+    sp_tracks = [
+        {"track_id": s.get("track_id"), "uri": s.get("uri"), "title": s.get("title"), "artist": s.get("match_artist")}
+        for s in sp_result["songs"]
+    ]
+    yt_tracks = [
+        {"video_id": v.get("video_id"), "item_id": v.get("item_id"), "title": v.get("title"), "artist": v.get("artist")}
+        for v in yt_result["songs"]
+    ]
+    skipped_sp = sum(1 for t in sp_tracks if not t["track_id"])
+
+    def match_fn(song, target):
+        if budget.out_of_time():
+            raise MatchBudgetExceeded()
+        if target == YOUTUBE:
+            cached = deps.get_cached_song(
+                deps.normalize_song_text(song["title"]), deps.normalize_song_text(song["artist"])
+            )
+            if not (cached and cached.get(P.YOUTUBE)):
+                if budget.yt_searches_left <= 0:
+                    raise MatchBudgetExceeded()
+                budget.yt_searches_left -= 1
+                budget.yt_searches += 1
+                budget.yt_units += YT_COST_SEARCH
+            return deps.match_song(song, P.YOUTUBE, yt_token)
+        return deps.match_song(song, P.SPOTIFY, sp_token)
+
+    try:
+        plan = plan_sync(
+            snapshot=snapshot,
+            sp_tracks=sp_tracks,
+            yt_tracks=yt_tracks,
+            yt_unavailable=yt_result.get("unavailable", []),
+            match_fn=match_fn,
+            recently_unmatched=recently_unmatched,
+            same_song=lambda a, b: bool(b.get("title") and b.get("artist"))
+            and deps.song_matches(a, b["title"], [b["artist"]]),
+        )
+    except Exception as e:
+        # e.g. YouTubeAuthError from a search
+        log(f"[{label}] ERROR while matching: {type(e).__name__}: {e}. Skipped.")
+        return {"pair": pair["id"], "status": "error", "error": f"match: {type(e).__name__}"}
+
+    # Readable names for the log.
+    names = {t["track_id"]: _label(t) for t in sp_tracks if t["track_id"]}
+    names.update({v["video_id"]: _label(v) for v in yt_tracks if v["video_id"]})
+    for p in plan["new_snapshot"] or []:
+        names.setdefault(p["youtube_video_id"], names.get(p["spotify_track_id"], "?"))
+        names.setdefault(p["spotify_track_id"], names.get(p["youtube_video_id"], "?"))
+
+    log(f"[{label}] Spotify {len(sp_tracks)} songs ({skipped_sp} local/episode, ignored); "
+        f"YouTube {len(yt_tracks)} songs, {len(yt_result.get('unavailable', []))} unavailable; "
+        f"snapshot {len(snapshot)} pairs; {len(recently_unmatched)} recently-unmatched skipped")
+    log(describe_plan(label, plan, names))
+    old = {(p["spotify_track_id"], p["youtube_video_id"]) for p in snapshot}
+    for p in plan["new_snapshot"] or []:
+        s, y = p["spotify_track_id"], p["youtube_video_id"]
+        if (s, y) not in old:
+            log(f"  = new snapshot pair: Spotify {names.get(s, '?')} [{s}] <-> YouTube {names.get(y, '?')} [{y}]")
+    log(f"[{label}] DRY RUN: nothing was changed on Spotify, YouTube, or the snapshot.")
+
+    return {
+        "pair": pair["id"],
+        "status": plan["status"],
+        "spotify_add": len(plan["spotify_add"]),
+        "spotify_remove": len(plan["spotify_remove"]),
+        "yt_add": len(plan["yt_add"]),
+        "yt_remove": len(plan["yt_remove"]),
+        "unmatched": len(plan["unmatched"]),
+        "deferred": len(plan["deferred"]),
+    }
+
+
+def run_once(dry_run=None, pair_id=None, deps=None, log=print):
+    """One pass over Keep Synced pairs. No lease or settle check yet (Stages 3-4)."""
+    if dry_run is None:
+        dry_run = is_dry_run()
+    if not dry_run:
+        raise RuntimeError("Real writes are not implemented yet; SYNC_DRY_RUN must be true.")
+    deps = deps or default_deps()
+
+    started = time.monotonic()
+    budget = Budget(started + time_budget_seconds(), max_yt_searches())
+    results = []
+    with sync_db_conn() as conn:
+        pairs = load_pairs(conn, max_pairs(), pair_id)
+        log(f"auto-sync run: {len(pairs)} pair(s), dry_run={dry_run}, "
+            f"budget {time_budget_seconds()}s / {max_yt_searches()} YouTube searches")
+        for pair in pairs:
+            if budget.out_of_time():
+                log("Time budget used up; remaining pairs carry over to the next run.")
+                break
+            try:
+                results.append(sync_pair(conn, pair, deps, budget, dry_run, log))
+            except Exception as e:
+                # sync_pair handles its own errors; this is the last line of defence.
+                log(f"[{pair['name']} ({pair['id']})] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+                results.append({"pair": pair["id"], "status": "error", "error": type(e).__name__})
+            conn.rollback()  # end the read transaction between pairs
+
+    elapsed = time.monotonic() - started
+    log(f"auto-sync done in {elapsed:.1f}s. YouTube quota (est.): {budget.yt_units} units "
+        f"({budget.yt_searches} searches x {YT_COST_SEARCH} + list calls)")
+    return {"dry_run": dry_run, "pairs": results, "yt_units": budget.yt_units, "seconds": round(elapsed, 1)}

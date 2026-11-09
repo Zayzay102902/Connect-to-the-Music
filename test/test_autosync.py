@@ -334,6 +334,70 @@ def test_deferred_song_is_retried_next_run_and_not_removed():
     assert plan["spotify_remove"] == [] and plan["yt_remove"] == []
 
 
+# ---------------- local matching (no duplicate uploads) ----------------
+
+def test_song_already_on_other_side_as_different_upload_is_paired_not_added():
+    # Real case from the dev dry run: search picks ytA_search, but the
+    # playlist already has ytA_existing for the same song.
+    catalog = {("Song A", "Artist"): ("spA", "ytA_search")}
+    matcher = FakeMatcher(catalog)
+    plan = plan_sync(
+        snapshot=[],
+        sp_tracks=[sp("spA", "Song A")],
+        yt_tracks=[yt("ytA_existing", "song a")],
+        yt_unavailable=set(),
+        match_fn=matcher,
+        removal_cap=10,
+    )
+    assert plan["yt_add"] == [] and plan["spotify_add"] == []
+    assert snapshot_set(plan) == {("spA", "ytA_existing")}
+    assert matcher.calls == []  # no search spent
+
+
+def test_local_match_never_steals_an_already_paired_video():
+    # ytA is paired with spA. A new Spotify copy of the same song must not
+    # be paired with ytA a second time through local matching.
+    catalog = {("Song A", "Artist"): ("spA2", "ytA")}
+    plan = plan_sync(
+        snapshot=[pair("spA", "ytA")],
+        sp_tracks=[sp("spA", "Song A"), sp("spA2", "Song A")],
+        yt_tracks=[yt("ytA", "Song A")],
+        yt_unavailable=set(),
+        match_fn=FakeMatcher(catalog),
+        removal_cap=10,
+    )
+    # Falls through to search, which says ytA; ytA is already there, so no add.
+    assert plan["yt_add"] == []
+    assert snapshot_set(plan) == {("spA", "ytA"), ("spA2", "ytA")}
+
+
+def test_manual_sync_swap_is_resolved_locally_without_search():
+    matcher = FakeMatcher({})
+    plan = plan_sync(
+        snapshot=[pair("spA", "ytA")],
+        sp_tracks=[sp("spA", "Song A")],
+        yt_tracks=[yt("ytA2", "Song A")],
+        yt_unavailable=set(),
+        match_fn=matcher,
+        removal_cap=10,
+    )
+    assert plan["spotify_remove"] == [] and plan["spotify_add"] == []
+    assert snapshot_set(plan) == {("spA", "ytA2")}
+    assert matcher.calls == []
+
+
+def test_different_song_is_not_local_matched():
+    plan = plan_sync(
+        snapshot=[],
+        sp_tracks=[sp("spA", "Song A")],
+        yt_tracks=[yt("ytB", "Song B")],
+        yt_unavailable=set(),
+        match_fn=FakeMatcher(),
+        removal_cap=10,
+    )
+    assert plan["yt_add"] == ["ytA"] and plan["spotify_add"] == ["spB"]
+
+
 # ---------------- fetch validation ----------------
 
 def ok(songs, truncated=False):

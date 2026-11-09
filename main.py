@@ -147,8 +147,9 @@ def get_spotify_songs(sp_id: str, sp_access_token: str):
     return songs
 
 
-def get_valid_youtube_token(user_id: str):
-    with get_db_conn() as conn:
+def get_valid_youtube_token(user_id: str, get_conn=None):
+    # get_conn lets auto-sync use its own connection (see autosync.resolve_database_url).
+    with (get_conn or get_db_conn)() as conn:
         cur = conn.cursor()
         try:
             cur.execute(
@@ -197,8 +198,9 @@ def get_valid_youtube_token(user_id: str):
             cur.close()
 
 
-def get_valid_spotify_token(user_id: str) -> str:
-    with get_db_conn() as conn:
+def get_valid_spotify_token(user_id: str, get_conn=None) -> str:
+    # get_conn lets auto-sync use its own connection (see autosync.resolve_database_url).
+    with (get_conn or get_db_conn)() as conn:
         cur = conn.cursor()
         try:
             cur.execute(
@@ -1150,9 +1152,14 @@ def youtube_display_song(raw_title: str, channel_title: str):
     return {"title": raw_title, "artist": None}
 
 
-def fetch_youtube_tracks(yt_id: str, yt_access_token: str):
+def fetch_youtube_tracks(yt_id: str, yt_access_token: str, include_ids: bool = False):
+    # include_ids=True is for auto-sync: each song also gets video_id and
+    # item_id (the playlistItem id needed to remove it), and the video ids of
+    # deleted/private placeholders come back in "unavailable" so they aren't
+    # mistaken for removals. With the default False the output is unchanged.
     songs = []
     hidden = 0
+    unavailable = []
     page_token = None
     for _ in range(TRACKS_MAX_PAGES):
         params = {"part": "snippet", "playlistId": yt_id, "maxResults": 50}
@@ -1171,21 +1178,37 @@ def fetch_youtube_tracks(yt_id: str, yt_access_token: str):
             snippet = item.get("snippet", {})
             title = snippet.get("title", "")
             channel = snippet.get("videoOwnerChannelTitle")
+            video_id = (snippet.get("resourceId") or {}).get("videoId")
             if not channel and title in YOUTUBE_UNAVAILABLE_TITLES:
                 hidden += 1
+                if include_ids and video_id:
+                    unavailable.append(video_id)
                 continue
             if not title:
+                if include_ids and video_id:
+                    unavailable.append(video_id)
                 continue
-            songs.append(youtube_display_song(title, channel))
+            song = youtube_display_song(title, channel)
+            if include_ids:
+                song["video_id"] = video_id
+                song["item_id"] = item.get("id")
+            songs.append(song)
 
         page_token = data.get("nextPageToken")
         if not page_token:
             break
 
-    return {"songs": songs, "hidden": hidden, "truncated": bool(page_token)}
+    result = {"songs": songs, "hidden": hidden, "truncated": bool(page_token)}
+    if include_ids:
+        result["unavailable"] = unavailable
+    return result
 
 
-def fetch_spotify_tracks(sp_id: str, sp_access_token: str):
+def fetch_spotify_tracks(sp_id: str, sp_access_token: str, include_ids: bool = False):
+    # include_ids=True is for auto-sync: each song also gets track_id, uri and
+    # match_artist (the first artist, for searching). track_id is None for
+    # local files and podcast episodes, which auto-sync leaves alone.
+    # With the default False the output is unchanged.
     songs = []
     url = f"https://api.spotify.com/v1/playlists/{sp_id}/items"
     params = {"limit": 50}
@@ -1208,7 +1231,13 @@ def fetch_spotify_tracks(sp_id: str, sp_access_token: str):
             # Podcast episodes have no artists; show the show's name instead.
             if not artists and (track.get("show") or {}).get("name"):
                 artists = [track["show"]["name"]]
-            songs.append({"title": name, "artist": ", ".join(artists) or None})
+            song = {"title": name, "artist": ", ".join(artists) or None}
+            if include_ids:
+                is_track = track.get("type", "track") == "track" and not track.get("is_local")
+                song["track_id"] = track.get("id") if is_track else None
+                song["uri"] = track.get("uri")
+                song["match_artist"] = artists[0] if artists and is_track else None
+            songs.append(song)
 
         # "next" is a full URL that already carries offset and limit.
         url = data.get("next")
