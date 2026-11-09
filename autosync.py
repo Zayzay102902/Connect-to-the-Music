@@ -62,6 +62,11 @@ def max_yt_searches():
     return env_int("SYNC_MAX_YT_SEARCHES", 5)
 
 
+def max_yt_writes():
+    # Inserts + deletes per run, 50 quota units each.
+    return env_int("SYNC_MAX_YT_WRITES", 10)
+
+
 # ============================================================
 # DATABASE (the runner's own connection)
 # ============================================================
@@ -452,6 +457,16 @@ def save_snapshot(conn, pair_id, pairs):
 # SETTLE CHECK (pure)
 # ============================================================
 
+SPOTIFY_BATCH = 100          # Spotify add/remove accept at most 100 URIs per call
+SPOTIFY_STALE_MINUTES = 3    # GET snapshot_id lags writes by up to ~1 min (tested on dev)
+YT_FATAL_REASONS = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
+
+
+class SoftWriteError(Exception):
+    """One item couldn't be written (e.g. a video that can't be added).
+    The song is skipped; the rest of the pair still syncs."""
+
+
 LEASE_MINUTES = 5            # a run's lease expires after this (crash safety)
 SETTLE_QUIET_RUNS = 2        # runs in a row with no new change before syncing
 BACKSTOP_MINUTES = 15        # full re-check for YouTube playlists > 50 items
@@ -498,6 +513,17 @@ def settle_step(state, obs, now, check_youtube):
     st["last_checked_at"] = now
 
     sp_changed = not first and obs["spotify_snapshot_id"] != st["spotify_snapshot_id"]
+    if (
+        sp_changed
+        and st["last_synced_at"] is not None
+        and now - st["last_synced_at"] < timedelta(minutes=SPOTIFY_STALE_MINUTES)
+    ):
+        # Spotify's GET snapshot_id lags writes by up to ~1 minute (tested on
+        # dev), so right after a sync it can still show the pre-write version.
+        # Ignore it for now and keep our stored value; a real user edit still
+        # shows up as a difference once the window has passed.
+        sp_changed = False
+        obs = dict(obs, spotify_snapshot_id=st["spotify_snapshot_id"])
     # A YouTube etag we've never recorded (pair first seen on a Spotify-only
     # run) is a first observation, not a change.
     yt_changed = (
@@ -557,8 +583,11 @@ def after_sync(state, result, now):
         st["last_synced_at"] = now
         st["last_error"] = None
         st["last_error_at"] = None
-        # Songs deferred by the search budget: stay pending, continue next run.
+        # Songs deferred by the search/write budget: stay pending, continue next run.
         st["pending"] = bool(result.get("deferred"))
+        # Version markers after our own writes, so they don't look like a change.
+        for k, v in (result.get("markers") or {}).items():
+            st[k] = v
     elif result["status"] == "skipped_removal_cap":
         st["last_error"] = f"removal cap: would remove {result.get('would_remove')} songs"
         st["last_error_at"] = now
@@ -678,6 +707,31 @@ class DbStore:
         finally:
             self.conn.rollback()
 
+    def save_snapshot(self, pair_id, pairs):
+        save_snapshot(self.conn, pair_id, pairs)
+
+    def record_unmatched(self, pair_id, rows):
+        rows = [r for r in rows if r.get("source_id")]
+        if not rows:
+            return
+        cur = self.conn.cursor()
+        try:
+            cur.executemany(
+                """INSERT INTO sync_unmatched (pair_id, source_platform, source_id, title, artist, reason, last_tried_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, now())
+                   ON CONFLICT (pair_id, source_platform, source_id) DO UPDATE SET
+                       title = EXCLUDED.title, artist = EXCLUDED.artist,
+                       reason = EXCLUDED.reason, last_tried_at = now()""",
+                [(pair_id, r["platform"], r["source_id"], r.get("title"), r.get("artist"), (r.get("reason") or "")[:500])
+                 for r in rows],
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
+
     def load_recently_unmatched(self, pair_id, hours=24):
         cur = self.conn.cursor()
         try:
@@ -735,6 +789,28 @@ class MainDeps:
         data = r.json()
         return data["etag"], (data.get("pageInfo") or {}).get("totalResults")
 
+    def youtube_marker_full(self, yt_id, token):
+        """Like youtube_marker, plus the first page's video and item ids, to
+        check that our own writes are already visible. 1 unit."""
+        r = self.requests.get(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"part": "snippet", "playlistId": yt_id, "maxResults": YT_ETAG_PAGE},
+            timeout=self.m.TRACKS_TIMEOUT_SECONDS,
+        )
+        self.m.check_platform_response(r)
+        data = r.json()
+        items = data.get("items", [])
+        return {
+            "etag": data["etag"],
+            "count": (data.get("pageInfo") or {}).get("totalResults"),
+            "video_ids": [((i.get("snippet") or {}).get("resourceId") or {}).get("videoId") for i in items],
+            "item_ids": [i.get("id") for i in items],
+        }
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
     def fetch_spotify(self, sp_id, token):
         return self.m.fetch_spotify_tracks(sp_id, token, include_ids=True)
 
@@ -754,16 +830,83 @@ class MainDeps:
     def same_song(self, a, b):
         return bool(b.get("title") and b.get("artist")) and self.m.song_matches(a, b["title"], [b["artist"]])
 
+    # ---- writes (only called when SYNC_DRY_RUN is false) ----
+
+    def _spotify_write(self, method, sp_id, token, body):
+        r = self.requests.request(
+            method,
+            f"https://api.spotify.com/v1/playlists/{sp_id}/items",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=self.m.TRACKS_TIMEOUT_SECONDS,
+        )
+        if r.status_code not in (200, 201):
+            self.m.check_platform_response(r)  # raises PlatformAuthError / PlatformFetchError
+            raise RuntimeError(f"Spotify {method} /items returned HTTP {r.status_code}")
+        return r.json().get("snapshot_id")
+
+    def spotify_add(self, sp_id, token, uris):
+        """Add up to 100 URIs. Returns the new snapshot_id."""
+        assert 0 < len(uris) <= SPOTIFY_BATCH
+        return self._spotify_write("POST", sp_id, token, {"uris": list(uris)})
+
+    def spotify_remove(self, sp_id, token, uris):
+        """Remove up to 100 URIs. One URI removes every copy of that track
+        (tested on dev). Returns the new snapshot_id."""
+        assert 0 < len(uris) <= SPOTIFY_BATCH
+        return self._spotify_write("DELETE", sp_id, token, {"items": [{"uri": u} for u in uris]})
+
+    def youtube_add(self, yt_id, token, video_id):
+        r = self.requests.post(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            params={"part": "snippet"},
+            json={"snippet": {"playlistId": yt_id, "resourceId": {"kind": "youtube#video", "videoId": video_id}}},
+            timeout=self.m.TRACKS_TIMEOUT_SECONDS,
+        )
+        if r.status_code == 200:
+            return r.json().get("id")
+        reason = _youtube_reason(r)
+        # This one video can't be added (deleted, private, blocked...). Skip
+        # the song, keep syncing the rest.
+        if r.status_code in (400, 404) or (r.status_code == 403 and reason not in YT_FATAL_REASONS):
+            raise SoftWriteError(f"YouTube refused the video (HTTP {r.status_code} {reason})".strip())
+        self.m.check_platform_response(r)
+        raise RuntimeError(f"YouTube insert returned HTTP {r.status_code}")
+
+    def youtube_remove(self, token, item_id):
+        r = self.requests.delete(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"id": item_id},
+            timeout=self.m.TRACKS_TIMEOUT_SECONDS,
+        )
+        if r.status_code == 204:
+            return
+        if r.status_code == 404:
+            return  # already gone: that's the outcome we wanted
+        self.m.check_platform_response(r)
+        raise RuntimeError(f"YouTube delete returned HTTP {r.status_code}")
+
+
+def _youtube_reason(response):
+    try:
+        errors = response.json().get("error", {}).get("errors", [])
+        return errors[0].get("reason", "") if errors else ""
+    except Exception:
+        return ""
+
 
 # ============================================================
 # RUNNER
 # ============================================================
 
 class Budget:
-    def __init__(self, deadline, yt_searches, clock=time.monotonic):
+    def __init__(self, deadline, yt_searches, clock=time.monotonic, yt_writes=None):
         self.deadline = deadline
         self.clock = clock
         self.yt_searches_left = yt_searches
+        self.yt_writes_left = max_yt_writes() if yt_writes is None else yt_writes
         self.yt_units = 0
         self.yt_searches = 0
         self.yt_checks = 0
@@ -791,9 +934,6 @@ def sync_pair(store, pair, deps, tokens, budget, dry_run, log):
     """Plan (and, later, apply) one pair. Returns a summary dict; never raises
     for platform errors."""
     label = f"{pair['name']} ({pair['id']})"
-    if not dry_run:
-        # Real writes are not implemented yet. Refuse rather than guess.
-        raise RuntimeError("Real writes are not implemented yet; SYNC_DRY_RUN must be true.")
     sp_token, yt_token = tokens
 
     snapshot = store.load_snapshot(pair["id"])
@@ -875,9 +1015,8 @@ def sync_pair(store, pair, deps, tokens, budget, dry_run, log):
         s, y = p["spotify_track_id"], p["youtube_video_id"]
         if (s, y) not in old:
             log(f"  = new snapshot pair: Spotify {names.get(s, '?')} [{s}] <-> YouTube {names.get(y, '?')} [{y}]")
-    log(f"[{label}] DRY RUN: nothing was changed on Spotify, YouTube, or the snapshot.")
 
-    return {
+    summary = {
         "pair": pair["id"],
         "status": plan["status"],
         "would_remove": plan.get("would_remove"),
@@ -888,6 +1027,178 @@ def sync_pair(store, pair, deps, tokens, budget, dry_run, log):
         "unmatched": len(plan["unmatched"]),
         "deferred": len(plan["deferred"]),
     }
+
+    if dry_run:
+        log(f"[{label}] DRY RUN: nothing was changed on Spotify, YouTube, or the snapshot.")
+        return summary
+    if plan["status"] != "ok":
+        log(f"[{label}] Not applied ({plan['status']}). Playlist left alone, snapshot kept.")
+        return summary
+
+    # ---------------- real writes ----------------
+    try:
+        applied = apply_plan(pair, plan, snapshot, tokens, deps, budget, log)
+    except WriteAborted as e:
+        log(f"[{label}] WRITE FAILED, stopped: {e}. Done before the failure: {e.done}. "
+            f"Snapshot NOT saved; the next sync recomputes from both playlists.")
+        return {**summary, "status": "error", "error": f"write: {e}"}
+
+    # Songs we couldn't match, or whose video YouTube refused: remember them
+    # so we don't spend searches on them again for 24 hours.
+    unmatched_rows = list(plan["unmatched"])
+    sp_for_video = {p["youtube_video_id"]: p["spotify_track_id"] for p in plan["new_snapshot"]}
+    for y, reason in applied["soft_failed"].items():
+        s = sp_for_video.get(y)
+        t = next((t for t in sp_tracks if t["track_id"] == s), {})
+        unmatched_rows.append({"platform": SPOTIFY, "source_id": s, "title": t.get("title"),
+                               "artist": t.get("artist"), "reason": reason})
+    try:
+        store.record_unmatched(pair["id"], unmatched_rows)
+    except Exception as e:
+        log(f"[{label}] couldn't record unmatched songs: {type(e).__name__}: {e}")
+
+    # Only now, after every write succeeded, save the snapshot.
+    store.save_snapshot(pair["id"], applied["snapshot"])
+    deferred_note = f", {applied['deferred']} write(s) deferred to the next run" if applied["deferred"] else ""
+    log(f"[{label}] APPLIED. Snapshot saved: {len(applied['snapshot'])} pairs{deferred_note}.")
+
+    # Record the platforms' new version markers so our own writes don't look
+    # like a user change next run.
+    markers = {}
+    if applied["wrote_spotify"] and applied["spotify_snapshot_id"]:
+        # Spotify's GET lags writes; the write response is what it settles on.
+        markers["spotify_snapshot_id"] = applied["spotify_snapshot_id"]
+    if applied["wrote_youtube"]:
+        before = len(yt_tracks) + len(yt_result.get("unavailable", []))
+        try:
+            markers.update(reread_youtube_marker(pair, deps, yt_token, applied["done"], before, budget, log))
+        except Exception as e:
+            log(f"[{label}] couldn't re-read the YouTube etag ({_error_text(e)}); next check may re-sync once, harmlessly.")
+    log(f"[{label}] markers after sync: {markers or 'no writes, unchanged'}")
+
+    return {**summary, "deferred": summary["deferred"] + applied["deferred"],
+            "soft_failed": len(applied["soft_failed"]), "markers": markers, "applied": True}
+
+
+class WriteAborted(Exception):
+    def __init__(self, message, done):
+        super().__init__(message)
+        self.done = done
+
+
+def apply_plan(pair, plan, old_snapshot, tokens, deps, budget, log):
+    """Apply a plan to both platforms. Adds first, removals last.
+
+    Returns {"snapshot", "deferred", "soft_failed", "spotify_snapshot_id", "wrote_spotify", "wrote_youtube"}.
+    Raises WriteAborted on any hard error; the caller must NOT save the
+    snapshot then (the next sync recomputes; local matching pairs up
+    anything that already landed, so nothing is duplicated).
+    """
+    label = f"{pair['name']} ({pair['id']})"
+    sp_token, yt_token = tokens
+
+    # Belt and braces: plan_sync already enforces these.
+    removal_count = len(plan["spotify_remove"]) + len({r["video_id"] for r in plan["yt_remove"]})
+    if plan["first_sync"] and removal_count:
+        raise WriteAborted("refusing: removals on a first sync", {})
+    if removal_count > max_removals():
+        raise WriteAborted(f"refusing: {removal_count} removals is over the cap", {})
+
+    done = {"spotify_add": [], "yt_add": [], "spotify_remove": [], "yt_remove_items": []}
+    sp_snapshot_id = None
+    soft_failed = {}       # video_id -> reason
+    deferred_yt_add = []
+    deferred_yt_remove = set()
+
+    def chunks(items):
+        for i in range(0, len(items), SPOTIFY_BATCH):
+            yield items[i:i + SPOTIFY_BATCH]
+
+    try:
+        # 1. Spotify adds (free, batched)
+        uris = [f"spotify:track:{s}" for s in plan["spotify_add"]]
+        for chunk in chunks(uris):
+            log(f"[{label}] WRITE Spotify add {len(chunk)}: {chunk}")
+            sp_snapshot_id = deps.spotify_add(pair["sp_id"], sp_token, chunk)
+            done["spotify_add"] += [u.rsplit(":", 1)[1] for u in chunk]
+
+        # 2. YouTube adds (50 units each, capped per run)
+        for y in plan["yt_add"]:
+            if budget.yt_writes_left <= 0 or budget.out_of_time():
+                deferred_yt_add.append(y)
+                continue
+            log(f"[{label}] WRITE YouTube add video {y}")
+            budget.yt_writes_left -= 1
+            budget.yt_units += YT_COST_INSERT
+            try:
+                deps.youtube_add(pair["yt_id"], yt_token, y)
+                done["yt_add"].append(y)
+            except SoftWriteError as e:
+                log(f"[{label}]   skipped video {y}: {e}")
+                soft_failed[y] = str(e)
+
+        # 3. Spotify removals (batched; one URI removes every copy)
+        uris = sorted({r["uri"] for r in plan["spotify_remove"]})
+        for chunk in chunks(uris):
+            log(f"[{label}] WRITE Spotify remove {len(chunk)}: {chunk}")
+            sp_snapshot_id = deps.spotify_remove(pair["sp_id"], sp_token, chunk)
+            done["spotify_remove"] += [u.rsplit(":", 1)[1] for u in chunk]
+
+        # 4. YouTube removals by playlistItem id (50 units each, capped per run)
+        for r in plan["yt_remove"]:
+            if budget.yt_writes_left <= 0 or budget.out_of_time():
+                deferred_yt_remove.add(r["video_id"])
+                continue
+            log(f"[{label}] WRITE YouTube remove item {r['item_id']} (video {r['video_id']})")
+            budget.yt_writes_left -= 1
+            budget.yt_units += YT_COST_DELETE
+            deps.youtube_remove(yt_token, r["item_id"])
+            done["yt_remove_items"].append(r["item_id"])
+    except Exception as e:
+        raise WriteAborted(f"{type(e).__name__}: {_error_text(e)}", done) from e
+
+    # Snapshot = the plan's, adjusted to what actually happened.
+    not_added = set(deferred_yt_add) | set(soft_failed)
+    snapshot = [p for p in plan["new_snapshot"] if p["youtube_video_id"] not in not_added]
+    # A removal we didn't get to: keep its old pair, so next run sees it again.
+    snapshot += [p for p in old_snapshot if p["youtube_video_id"] in deferred_yt_remove]
+    snapshot = _dedupe_pairs(snapshot)
+
+    return {
+        "snapshot": snapshot,
+        "deferred": len(deferred_yt_add) + len(deferred_yt_remove),
+        "soft_failed": soft_failed,
+        "spotify_snapshot_id": sp_snapshot_id,
+        "wrote_spotify": bool(done["spotify_add"] or done["spotify_remove"]),
+        "wrote_youtube": bool(done["yt_add"] or done["yt_remove_items"]),
+        "done": done,
+    }
+
+
+YT_REREAD_WAITS = (0, 2, 3, 5)   # seconds before each re-read try (max 4 units)
+
+
+def reread_youtube_marker(pair, deps, yt_token, done, count_before, budget, log):
+    """Re-read the YouTube etag after our writes, waiting until the list
+    actually shows them (YouTube lags writes by a few seconds; tested on dev).
+    Falls back to the last etag seen; worst case is one harmless no-op sync."""
+    expected = count_before + len(done["yt_add"]) - len(done["yt_remove_items"])
+    seen = None
+    for wait in YT_REREAD_WAITS:
+        if wait:
+            deps.sleep(wait)
+        seen = deps.youtube_marker_full(pair["yt_id"], yt_token)
+        budget.yt_units += YT_COST_LIST
+        caught_up = seen["count"] == expected
+        if caught_up and (seen["count"] or 0) <= YT_ETAG_PAGE:
+            caught_up = set(done["yt_add"]) <= set(seen["video_ids"]) and not (
+                set(done["yt_remove_items"]) & set(seen["item_ids"])
+            )
+        if caught_up:
+            return {"youtube_etag": seen["etag"], "youtube_item_count": seen["count"]}
+    log(f"[{pair['name']} ({pair['id']})] YouTube still showed {seen['count']} items (expected {expected}) "
+        f"after re-reading; storing the last etag seen. The next check may re-sync once, harmlessly.")
+    return {"youtube_etag": seen["etag"], "youtube_item_count": seen["count"]}
 
 
 def max_checks():
@@ -903,9 +1214,7 @@ def run_once(dry_run=None, pair_id=None, deps=None, store=None, log=print,
     """One pass: check every pair cheaply, sync the ones that have settled.
     Returns {"status": "busy"} at once if another run holds the lease."""
     if dry_run is None:
-        dry_run = is_dry_run()
-    if not dry_run:
-        raise RuntimeError("Real writes are not implemented yet; SYNC_DRY_RUN must be true.")
+        dry_run = is_dry_run()  # defaults to true
     now = now or _utc_now()
 
     if store is None:

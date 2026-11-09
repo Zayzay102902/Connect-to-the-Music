@@ -220,7 +220,8 @@ def test_lease_is_released_even_if_the_run_crashes():
     assert sim.store.released[-1]["status"] == "error"
 
 
-def test_dry_run_still_required():
-    import pytest
-    with pytest.raises(RuntimeError):
-        autosync.run_once(dry_run=False, store=object(), deps=object())
+def test_run_once_defaults_to_dry_run(monkeypatch):
+    monkeypatch.delenv("SYNC_DRY_RUN", raising=False)
+    sim = Sim()
+    r = autosync.run_once(deps=sim.deps, store=sim.store, log=lambda *_: None, now=T0, clock=lambda: 0.0)
+    assert r["dry_run"] is True

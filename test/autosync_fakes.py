@@ -46,6 +46,13 @@ class FakeStore:
     def load_recently_unmatched(self, pair_id, hours=24):
         return set(self.unmatched)
 
+    def save_snapshot(self, pair_id, pairs):
+        self.snapshots[pair_id] = [dict(p) for p in pairs]
+
+    def record_unmatched(self, pair_id, rows):
+        for r in rows:
+            self.unmatched.add((r["platform"], r["source_id"]))
+
 
 class FakeWorld:
     """What the two platforms currently look like. Tests mutate this between runs."""
@@ -54,10 +61,19 @@ class FakeWorld:
         self.sp_snapshot = "sp-v1"
         self.yt_etag = "yt-v1"
         self.yt_count = yt_count
-        self.sp_songs = sp_songs or [("spA", "Song A", "Artist")]
-        self.yt_songs = yt_songs or [("ytA", "Song A", "Artist")]
+        self.sp_songs = list(sp_songs) if sp_songs is not None else [("spA", "Song A", "Artist")]
+        self.yt_songs = list(yt_songs) if yt_songs is not None else [("ytA", "Song A", "Artist")]
         self.fail_fetch = None   # "spotify" / "youtube" to make the full fetch fail
         self.fail_marker = None  # exception to raise from the cheap checks
+        self.fail_write = None   # "spotify_add" / "yt_add" to make that write fail hard
+        self.refuse_videos = set()  # videos YouTube won't accept (soft failure)
+        self.sp_version = 0
+        self.stale_sp_snapshot = None
+        self.sp_lag = False      # True: Spotify GET returns the pre-write snapshot_id once
+        self.yt_lag_reads = 0    # re-reads after a write that still return the old list
+        self.stale_yt = None     # (etag, songs) before our first YouTube write this sync
+        self.slept = []
+        self.writes = []
         self.calls = {"sp_marker": 0, "yt_marker": 0, "sp_fetch": 0, "yt_fetch": 0, "search": 0}
 
     def edit_spotify(self, new_version):
@@ -81,6 +97,9 @@ class FakeDeps:
         self.w.calls["sp_marker"] += 1
         if self.w.fail_marker:
             raise self.w.fail_marker
+        if self.w.sp_lag and self.w.stale_sp_snapshot:
+            self.w.sp_lag = False
+            return self.w.stale_sp_snapshot
         return self.w.sp_snapshot
 
     def youtube_marker(self, yt_id, token):
@@ -88,6 +107,19 @@ class FakeDeps:
         if self.w.fail_marker:
             raise self.w.fail_marker
         return self.w.yt_etag, self.w.yt_count if self.w.yt_count is not None else len(self.w.yt_songs)
+
+    def youtube_marker_full(self, yt_id, token):
+        self.w.calls["yt_marker"] += 1
+        if self.w.yt_lag_reads > 0 and self.w.stale_yt is not None:
+            self.w.yt_lag_reads -= 1
+            etag, songs = self.w.stale_yt
+        else:
+            etag, songs = self.w.yt_etag, self.w.yt_songs
+        return {"etag": etag, "count": len(songs),
+                "video_ids": [v[0] for v in songs], "item_ids": [f"item-{v[0]}" for v in songs]}
+
+    def sleep(self, seconds):
+        self.w.slept.append(seconds)
 
     def fetch_spotify(self, sp_id, token):
         self.w.calls["sp_fetch"] += 1
@@ -114,6 +146,54 @@ class FakeDeps:
     def same_song(self, a, b):
         return autosync.default_same_song(a, b)
 
+    # ---- writes: mutate the fake world like the real APIs would ----
+
+    def _song_for(self, some_id):
+        key = some_id[2:]  # "spB" / "ytB" -> "B"
+        return f"Song {key}", "Artist"
+
+    def _bump_spotify(self):
+        self.w.sp_version += 1
+        self.w.stale_sp_snapshot = self.w.sp_snapshot   # GET may lag (see world.sp_lag)
+        self.w.sp_snapshot = f"sp-w{self.w.sp_version}"
+        return self.w.sp_snapshot
+
+    def spotify_add(self, sp_id, token, uris):
+        assert len(uris) <= autosync.SPOTIFY_BATCH
+        self.w.writes.append(("spotify_add", list(uris)))
+        if self.w.fail_write == "spotify_add":
+            raise RuntimeError("HTTP 502")
+        for u in uris:
+            tid = u.rsplit(":", 1)[1]
+            self.w.sp_songs.append((tid, *self._song_for(tid)))
+        return self._bump_spotify()
+
+    def spotify_remove(self, sp_id, token, uris):
+        assert len(uris) <= autosync.SPOTIFY_BATCH
+        self.w.writes.append(("spotify_remove", list(uris)))
+        ids = {u.rsplit(":", 1)[1] for u in uris}
+        self.w.sp_songs = [s for s in self.w.sp_songs if s[0] not in ids]  # every copy
+        return self._bump_spotify()
+
+    def youtube_add(self, yt_id, token, video_id):
+        if self.w.stale_yt is None:
+            self.w.stale_yt = (self.w.yt_etag, list(self.w.yt_songs))
+        self.w.writes.append(("yt_add", video_id))
+        if video_id in self.w.refuse_videos:
+            raise autosync.SoftWriteError("YouTube refused the video (HTTP 404 videoNotFound)")
+        if self.w.fail_write == "yt_add":
+            raise RuntimeError("HTTP 500")
+        self.w.yt_songs.append((video_id, *self._song_for(video_id)))
+        self.w.yt_etag = f"yt-w{len(self.w.writes)}"
+        return f"item-{video_id}"
+
+    def youtube_remove(self, token, item_id):
+        if self.w.stale_yt is None:
+            self.w.stale_yt = (self.w.yt_etag, list(self.w.yt_songs))
+        self.w.writes.append(("yt_remove", item_id))
+        self.w.yt_songs = [v for v in self.w.yt_songs if f"item-{v[0]}" != item_id]
+        self.w.yt_etag = f"yt-w{len(self.w.writes)}"
+
 
 PAIR = {"id": "pair-1", "user_id": "u1", "name": "Road Trip", "sp_id": "SP1", "yt_id": "YT1"}
 
@@ -129,9 +209,9 @@ class Sim:
         self.lines = []
         self.log = log or self.lines.append
 
-    def run(self):
+    def run(self, dry_run=True):
         result = autosync.run_once(
-            dry_run=True, deps=self.deps, store=self.store, log=self.log,
+            dry_run=dry_run, deps=self.deps, store=self.store, log=self.log,
             now=self.now, clock=lambda: 0.0,
         )
         self.now += RUN_INTERVAL
