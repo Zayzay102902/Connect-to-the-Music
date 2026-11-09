@@ -1,5 +1,7 @@
 # 🎶 Connect to the Music 🎶
 
+> **Note:** Google shows an "unverified app" screen when you sign in, because this is a personal project that hasn't gone through Google's review. It's safe to continue: click "Advanced", then "Go to connect-to-the-music.onrender.com (unsafe)". The app uses YouTube access only to read and manage your playlists, and your basic Google profile to sign you in.
+
 A full-stack web application that allows users to create, sync, copy, and manage playlists across both **YouTube** and **Spotify** from a single unified dashboard.
 
 - **Backend:** FastAPI (Python)
