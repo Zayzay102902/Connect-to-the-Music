@@ -14,6 +14,7 @@ import math
 import os
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SPOTIFY = "spotify"
@@ -445,41 +446,275 @@ def save_snapshot(conn, pair_id, pairs):
         cur.close()
 
 
-def load_recently_unmatched(conn, pair_id, hours=24):
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """SELECT source_platform, source_id FROM sync_unmatched
-               WHERE pair_id = %s AND last_tried_at > now() - make_interval(hours => %s)""",
-            (pair_id, hours),
+# ============================================================
+# SETTLE CHECK (pure)
+# ============================================================
+
+SETTLE_QUIET_RUNS = 2        # runs in a row with no new change before syncing
+BACKSTOP_MINUTES = 15        # full re-check for YouTube playlists > 50 items
+ERROR_BACKOFF_MINUTES = 10   # after a failed sync, wait before retrying
+YT_ETAG_PAGE = 50            # the YouTube etag covers the first 50 items only
+
+STATE_FIELDS = (
+    "spotify_snapshot_id", "youtube_etag", "youtube_item_count", "pending",
+    "last_change_seen_at", "quiet_runs", "youtube_checked_since_change",
+    "last_checked_at", "last_synced_at", "last_error", "last_error_at",
+)
+
+
+def new_state():
+    return {
+        "spotify_snapshot_id": None, "youtube_etag": None, "youtube_item_count": None,
+        "pending": True, "last_change_seen_at": None, "quiet_runs": 0,
+        "youtube_checked_since_change": False, "last_checked_at": None,
+        "last_synced_at": None, "last_error": None, "last_error_at": None,
+    }
+
+
+def settle_step(state, obs, now, check_youtube):
+    """Decide what to do with one pair this run. Pure: no I/O.
+
+    state: the pair's sync_state row as a dict, or None if never checked.
+    obs:   {"spotify_snapshot_id"} plus, when check_youtube,
+           {"youtube_etag", "youtube_item_count"}.
+    Returns (new_state, decision, reason); decision is "sync", "wait" or "idle".
+
+    Rules:
+      * Any change (or first sight of the pair) marks it pending, resets the
+        quiet counter, and does not sync yet.
+      * Each run with no new change adds 1 to quiet_runs.
+      * A pending pair syncs once quiet_runs >= 2 AND YouTube has been checked
+        at least once since the last change (YouTube is only checked every
+        other run, so an edit there could still be in progress otherwise).
+      * YouTube playlists > 50 items get a full re-check every 15 min, since the
+        etag only covers the first page. It still waits for 2 quiet runs.
+      * After a failed sync, wait ERROR_BACKOFF_MINUTES before retrying.
+    """
+    first = state is None
+    st = dict(state) if state else new_state()
+    st["last_checked_at"] = now
+
+    sp_changed = not first and obs["spotify_snapshot_id"] != st["spotify_snapshot_id"]
+    # A YouTube etag we've never recorded (pair first seen on a Spotify-only
+    # run) is a first observation, not a change.
+    yt_changed = (
+        check_youtube and not first
+        and st["youtube_etag"] is not None
+        and obs["youtube_etag"] != st["youtube_etag"]
+    )
+    st["spotify_snapshot_id"] = obs["spotify_snapshot_id"]
+    if check_youtube:
+        st["youtube_etag"] = obs["youtube_etag"]
+        st["youtube_item_count"] = obs.get("youtube_item_count")
+
+    if first or sp_changed or yt_changed:
+        st.update(
+            pending=True,
+            last_change_seen_at=now,
+            quiet_runs=0,
+            youtube_checked_since_change=bool(check_youtube),
         )
-        return {(r[0], r[1]) for r in cur.fetchall()}
-    finally:
-        cur.close()
+        if first:
+            what = "first time seen"
+        else:
+            what = " and ".join(n for n, c in (("Spotify", sp_changed), ("YouTube", yt_changed)) if c) + " changed"
+        return st, "wait", f"{what}; waiting for {SETTLE_QUIET_RUNS} quiet runs"
+
+    st["quiet_runs"] = (st["quiet_runs"] or 0) + 1
+    if check_youtube:
+        st["youtube_checked_since_change"] = True
+
+    backstop = ""
+    if (
+        not st["pending"]
+        and check_youtube
+        and (st["youtube_item_count"] or 0) > YT_ETAG_PAGE
+        and (st["last_synced_at"] is None or now - st["last_synced_at"] >= timedelta(minutes=BACKSTOP_MINUTES))
+    ):
+        st["pending"] = True
+        backstop = f" (backstop: YouTube has {st['youtube_item_count']} items, more than the etag covers)"
+
+    if not st["pending"]:
+        return st, "idle", "no change"
+
+    if st["last_error_at"] and now - st["last_error_at"] < timedelta(minutes=ERROR_BACKOFF_MINUTES):
+        return st, "wait", f"backing off after error: {st['last_error']}"
+
+    if st["quiet_runs"] < SETTLE_QUIET_RUNS:
+        return st, "wait", f"quiet {st['quiet_runs']}/{SETTLE_QUIET_RUNS}{backstop}"
+    if not st["youtube_checked_since_change"]:
+        return st, "wait", "quiet long enough, but YouTube not checked since the change yet"
+    return st, "sync", f"settled: {st['quiet_runs']} quiet runs{backstop}"
 
 
-def load_pairs(conn, limit, pair_id=None):
-    """Keep Synced playlists that are linked on both platforms."""
-    cur = conn.cursor()
-    try:
-        sql = """SELECT id, user_id, playlist_name, spotify_playlist_id, youtube_playlist_id
-                 FROM playlists
-                 WHERE platform = 'both'
-                   AND spotify_playlist_id IS NOT NULL
-                   AND youtube_playlist_id IS NOT NULL"""
+def after_sync(state, result, now):
+    """Update state after a sync attempt (dry or real)."""
+    st = dict(state)
+    if result["status"] == "ok":
+        st["last_synced_at"] = now
+        st["last_error"] = None
+        st["last_error_at"] = None
+        # Songs deferred by the search budget: stay pending, continue next run.
+        st["pending"] = bool(result.get("deferred"))
+    elif result["status"] == "skipped_removal_cap":
+        st["last_error"] = f"removal cap: would remove {result.get('would_remove')} songs"
+        st["last_error_at"] = now
+    else:
+        st["last_error"] = (result.get("error") or "error")[:500]
+        st["last_error_at"] = now
+    return st
+
+
+# ============================================================
+# STORE (database, or a fake in tests)
+# ============================================================
+
+class DbStore:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def _one(self, sql, params=()):
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql, params)
+            return cur.fetchone()
+        finally:
+            cur.close()
+
+    def next_run_count(self):
+        row = self._one("UPDATE sync_runner SET run_count = run_count + 1 WHERE id = 1 RETURNING run_count")
+        self.conn.commit()
+        return row[0]
+
+    def load_pairs(self, limit, pair_id=None):
+        """Keep Synced pairs linked on both platforms, least recently checked first."""
+        cols = ", ".join(f"s.{f}" for f in STATE_FIELDS)
+        sql = f"""SELECT p.id, p.user_id, p.playlist_name, p.spotify_playlist_id, p.youtube_playlist_id,
+                         s.pair_id IS NOT NULL, {cols}
+                  FROM playlists p
+                  LEFT JOIN sync_state s ON s.pair_id = p.id
+                  WHERE p.platform = 'both'
+                    AND p.spotify_playlist_id IS NOT NULL
+                    AND p.youtube_playlist_id IS NOT NULL"""
         params = []
         if pair_id:
-            sql += " AND id = %s"
+            sql += " AND p.id = %s"
             params.append(pair_id)
-        sql += " ORDER BY created_at LIMIT %s"
+        sql += " ORDER BY s.last_checked_at ASC NULLS FIRST, p.created_at LIMIT %s"
         params.append(limit)
-        cur.execute(sql, params)
-        return [
-            {"id": str(r[0]), "user_id": str(r[1]), "name": r[2], "sp_id": r[3], "yt_id": r[4]}
-            for r in cur.fetchall()
-        ]
-    finally:
-        cur.close()
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+        self.conn.rollback()
+        pairs = []
+        for r in rows:
+            state = dict(zip(STATE_FIELDS, r[6:])) if r[5] else None
+            pairs.append({"id": str(r[0]), "user_id": str(r[1]), "name": r[2],
+                          "sp_id": r[3], "yt_id": r[4], "state": state})
+        return pairs
+
+    def save_state(self, pair_id, st):
+        cols = ", ".join(STATE_FIELDS)
+        marks = ", ".join(["%s"] * len(STATE_FIELDS))
+        updates = ", ".join(f"{f} = EXCLUDED.{f}" for f in STATE_FIELDS)
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"INSERT INTO sync_state (pair_id, {cols}) VALUES (%s, {marks}) "
+                f"ON CONFLICT (pair_id) DO UPDATE SET {updates}",
+                [pair_id] + [st[f] for f in STATE_FIELDS],
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+    def load_snapshot(self, pair_id):
+        try:
+            return load_snapshot(self.conn, pair_id)
+        finally:
+            self.conn.rollback()
+
+    def load_recently_unmatched(self, pair_id, hours=24):
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """SELECT source_platform, source_id FROM sync_unmatched
+                   WHERE pair_id = %s AND last_tried_at > now() - make_interval(hours => %s)""",
+                (pair_id, hours),
+            )
+            return {(r[0], r[1]) for r in cur.fetchall()}
+        finally:
+            cur.close()
+            self.conn.rollback()
+
+
+# ============================================================
+# PLATFORM DEPS (main.py's helpers, or a fake in tests)
+# ============================================================
+
+class MainDeps:
+    """Thin wrapper over main.py's existing helpers. Imported lazily because
+    main.py will import this module."""
+
+    def __init__(self):
+        import main
+        import requests
+
+        self.m = main
+        self.requests = requests
+
+    def spotify_token(self, user_id):
+        return self.m.get_valid_spotify_token(user_id, get_conn=sync_db_conn)
+
+    def youtube_token(self, user_id):
+        return self.m.get_valid_youtube_token(user_id, get_conn=sync_db_conn)
+
+    def spotify_marker(self, sp_id, token):
+        r = self.requests.get(
+            f"https://api.spotify.com/v1/playlists/{sp_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"fields": "snapshot_id"},
+            timeout=self.m.TRACKS_TIMEOUT_SECONDS,
+        )
+        self.m.check_platform_response(r)
+        return r.json()["snapshot_id"]
+
+    def youtube_marker(self, yt_id, token):
+        # Same request the etag test used (part=snippet, maxResults=50). 1 unit.
+        r = self.requests.get(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"part": "snippet", "playlistId": yt_id, "maxResults": YT_ETAG_PAGE},
+            timeout=self.m.TRACKS_TIMEOUT_SECONDS,
+        )
+        self.m.check_platform_response(r)
+        data = r.json()
+        return data["etag"], (data.get("pageInfo") or {}).get("totalResults")
+
+    def fetch_spotify(self, sp_id, token):
+        return self.m.fetch_spotify_tracks(sp_id, token, include_ids=True)
+
+    def fetch_youtube(self, yt_id, token):
+        return self.m.fetch_youtube_tracks(yt_id, token, include_ids=True)
+
+    def youtube_cached(self, song):
+        cached = self.m.get_cached_song(
+            self.m.normalize_song_text(song["title"]), self.m.normalize_song_text(song["artist"])
+        )
+        return bool(cached and cached.get(self.m.Platform.YOUTUBE))
+
+    def match(self, song, target, token):
+        platform = self.m.Platform.YOUTUBE if target == YOUTUBE else self.m.Platform.SPOTIFY
+        return self.m.match_song(song, platform, token)
+
+    def same_song(self, a, b):
+        return bool(b.get("title") and b.get("artist")) and self.m.song_matches(a, b["title"], [b["artist"]])
 
 
 # ============================================================
@@ -487,22 +722,16 @@ def load_pairs(conn, limit, pair_id=None):
 # ============================================================
 
 class Budget:
-    def __init__(self, deadline, yt_searches):
+    def __init__(self, deadline, yt_searches, clock=time.monotonic):
         self.deadline = deadline
+        self.clock = clock
         self.yt_searches_left = yt_searches
         self.yt_units = 0
         self.yt_searches = 0
+        self.yt_checks = 0
 
     def out_of_time(self):
-        return time.monotonic() >= self.deadline
-
-
-def default_deps():
-    # Imported lazily: main.py will import this module, and this module only
-    # needs main's helpers at run time.
-    import main
-
-    return main
+        return self.clock() >= self.deadline
 
 
 def _youtube_list_units(result):
@@ -516,31 +745,28 @@ def _label(song):
     return f"'{song.get('title')}' by {song.get('artist') or '?'}"
 
 
-def sync_pair(conn, pair, deps, budget, dry_run, log):
-    """Sync one pair. Returns a small summary dict; errors are logged, not raised."""
+def _error_text(e):
+    return getattr(e, "detail", None) or f"{type(e).__name__}: {e}"
+
+
+def sync_pair(store, pair, deps, tokens, budget, dry_run, log):
+    """Plan (and, later, apply) one pair. Returns a summary dict; never raises
+    for platform errors."""
     label = f"{pair['name']} ({pair['id']})"
     if not dry_run:
         # Real writes are not implemented yet. Refuse rather than guess.
         raise RuntimeError("Real writes are not implemented yet; SYNC_DRY_RUN must be true.")
+    sp_token, yt_token = tokens
 
-    P = deps.Platform
-    try:
-        sp_token = deps.get_valid_spotify_token(pair["user_id"], get_conn=sync_db_conn)
-        yt_token = deps.get_valid_youtube_token(pair["user_id"], get_conn=sync_db_conn)
-    except Exception as e:
-        detail = getattr(e, "detail", None) or str(e)
-        log(f"[{label}] ERROR getting tokens: {detail}. Skipped.")
-        return {"pair": pair["id"], "status": "error", "error": f"token: {detail}"}
-
-    snapshot = load_snapshot(conn, pair["id"])
-    recently_unmatched = load_recently_unmatched(conn, pair["id"])
+    snapshot = store.load_snapshot(pair["id"])
+    recently_unmatched = store.load_recently_unmatched(pair["id"])
 
     try:
-        sp_result = deps.fetch_spotify_tracks(pair["sp_id"], sp_token, include_ids=True)
+        sp_result = deps.fetch_spotify(pair["sp_id"], sp_token)
     except Exception as e:
         sp_result = e
     try:
-        yt_result = deps.fetch_youtube_tracks(pair["yt_id"], yt_token, include_ids=True)
+        yt_result = deps.fetch_youtube(pair["yt_id"], yt_token)
     except Exception as e:
         yt_result = e
     budget.yt_units += _youtube_list_units(yt_result)
@@ -571,17 +797,14 @@ def sync_pair(conn, pair, deps, budget, dry_run, log):
         if budget.out_of_time():
             raise MatchBudgetExceeded()
         if target == YOUTUBE:
-            cached = deps.get_cached_song(
-                deps.normalize_song_text(song["title"]), deps.normalize_song_text(song["artist"])
-            )
-            if not (cached and cached.get(P.YOUTUBE)):
+            if not deps.youtube_cached(song):
                 if budget.yt_searches_left <= 0:
                     raise MatchBudgetExceeded()
                 budget.yt_searches_left -= 1
                 budget.yt_searches += 1
                 budget.yt_units += YT_COST_SEARCH
-            return deps.match_song(song, P.YOUTUBE, yt_token)
-        return deps.match_song(song, P.SPOTIFY, sp_token)
+            return deps.match(song, YOUTUBE, yt_token)
+        return deps.match(song, SPOTIFY, sp_token)
 
     try:
         plan = plan_sync(
@@ -591,8 +814,7 @@ def sync_pair(conn, pair, deps, budget, dry_run, log):
             yt_unavailable=yt_result.get("unavailable", []),
             match_fn=match_fn,
             recently_unmatched=recently_unmatched,
-            same_song=lambda a, b: bool(b.get("title") and b.get("artist"))
-            and deps.song_matches(a, b["title"], [b["artist"]]),
+            same_song=deps.same_song,
         )
     except Exception as e:
         # e.g. YouTubeAuthError from a search
@@ -620,6 +842,7 @@ def sync_pair(conn, pair, deps, budget, dry_run, log):
     return {
         "pair": pair["id"],
         "status": plan["status"],
+        "would_remove": plan.get("would_remove"),
         "spotify_add": len(plan["spotify_add"]),
         "spotify_remove": len(plan["spotify_remove"]),
         "yt_add": len(plan["yt_add"]),
@@ -629,34 +852,84 @@ def sync_pair(conn, pair, deps, budget, dry_run, log):
     }
 
 
-def run_once(dry_run=None, pair_id=None, deps=None, log=print):
-    """One pass over Keep Synced pairs. No lease or settle check yet (Stages 3-4)."""
+def max_checks():
+    return env_int("SYNC_MAX_CHECKS", 25)
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def run_once(dry_run=None, pair_id=None, deps=None, store=None, log=print,
+             now=None, clock=time.monotonic):
+    """One pass: check every pair cheaply, sync the ones that have settled.
+    No overlap lease yet (Stage 4)."""
     if dry_run is None:
         dry_run = is_dry_run()
     if not dry_run:
         raise RuntimeError("Real writes are not implemented yet; SYNC_DRY_RUN must be true.")
-    deps = deps or default_deps()
+    now = now or _utc_now()
 
-    started = time.monotonic()
-    budget = Budget(started + time_budget_seconds(), max_yt_searches())
+    if store is None:
+        with sync_db_conn() as conn:
+            return run_once(dry_run, pair_id, deps, DbStore(conn), log, now, clock)
+    deps = deps or MainDeps()
+
+    started = clock()
+    budget = Budget(started + time_budget_seconds(), max_yt_searches(), clock)
+    run_count = store.next_run_count()
+    check_youtube = run_count % 2 == 0
+    pairs = store.load_pairs(max_checks(), pair_id)
+    log(f"auto-sync run #{run_count}: {len(pairs)} pair(s), dry_run={dry_run}, "
+        f"YouTube check {'ON' if check_youtube else 'off (every other run)'}")
+
     results = []
-    with sync_db_conn() as conn:
-        pairs = load_pairs(conn, max_pairs(), pair_id)
-        log(f"auto-sync run: {len(pairs)} pair(s), dry_run={dry_run}, "
-            f"budget {time_budget_seconds()}s / {max_yt_searches()} YouTube searches")
-        for pair in pairs:
-            if budget.out_of_time():
-                log("Time budget used up; remaining pairs carry over to the next run.")
-                break
-            try:
-                results.append(sync_pair(conn, pair, deps, budget, dry_run, log))
-            except Exception as e:
-                # sync_pair handles its own errors; this is the last line of defence.
-                log(f"[{pair['name']} ({pair['id']})] UNEXPECTED ERROR: {type(e).__name__}: {e}")
-                results.append({"pair": pair["id"], "status": "error", "error": type(e).__name__})
-            conn.rollback()  # end the read transaction between pairs
+    syncs = 0
+    for pair in pairs:
+        label = f"{pair['name']} ({pair['id']})"
+        if budget.out_of_time():
+            log("Time budget used up; remaining pairs carry over to the next run.")
+            break
+        state = pair["state"]
+        try:
+            tokens = (deps.spotify_token(pair["user_id"]), deps.youtube_token(pair["user_id"]))
+            obs = {"spotify_snapshot_id": deps.spotify_marker(pair["sp_id"], tokens[0])}
+            if check_youtube:
+                budget.yt_units += YT_COST_LIST
+                budget.yt_checks += 1
+                obs["youtube_etag"], obs["youtube_item_count"] = deps.youtube_marker(pair["yt_id"], tokens[1])
+        except Exception as e:
+            # Can't even check: record it, don't touch the settle counters.
+            log(f"[{label}] ERROR checking for changes: {_error_text(e)}. Skipped.")
+            st = dict(state) if state else new_state()
+            st.update(last_checked_at=now, last_error=f"check: {_error_text(e)}"[:500], last_error_at=now)
+            store.save_state(pair["id"], st)
+            results.append({"pair": pair["id"], "status": "error", "decision": "error"})
+            continue
 
-    elapsed = time.monotonic() - started
-    log(f"auto-sync done in {elapsed:.1f}s. YouTube quota (est.): {budget.yt_units} units "
-        f"({budget.yt_searches} searches x {YT_COST_SEARCH} + list calls)")
-    return {"dry_run": dry_run, "pairs": results, "yt_units": budget.yt_units, "seconds": round(elapsed, 1)}
+        st, decision, reason = settle_step(state, obs, now, check_youtube)
+        if decision == "sync" and syncs >= max_pairs():
+            decision, reason = "wait", f"settled, but this run's sync limit ({max_pairs()}) is used; next run"
+        log(f"[{label}] {decision.upper()}: {reason}")
+
+        result = {"pair": pair["id"], "status": "ok", "decision": decision}
+        if decision == "sync":
+            syncs += 1
+            try:
+                result = sync_pair(store, pair, deps, tokens, budget, dry_run, log)
+            except Exception as e:
+                # Last line of defence; sync_pair handles platform errors itself.
+                log(f"[{label}] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+                result = {"pair": pair["id"], "status": "error", "error": type(e).__name__}
+            result["decision"] = "sync"
+            st = after_sync(st, result, now)
+        store.save_state(pair["id"], st)
+        results.append(result)
+
+    elapsed = clock() - started
+    log(f"auto-sync run #{run_count} done in {elapsed:.1f}s, {syncs} sync(s). "
+        f"YouTube quota (est.): {budget.yt_units} units "
+        f"({budget.yt_checks} etag checks, {budget.yt_searches} searches x {YT_COST_SEARCH}, list calls)")
+    return {"run": run_count, "dry_run": dry_run, "check_youtube": check_youtube,
+            "pairs": results, "yt_units": budget.yt_units, "seconds": round(elapsed, 1)}
+

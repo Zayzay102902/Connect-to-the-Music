@@ -53,3 +53,8 @@ CREATE TABLE IF NOT EXISTS sync_runner (
     last_run_summary     jsonb
 );
 INSERT INTO sync_runner (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- Stage 3 addition: YouTube's etag only covers the first 50 items, so we
+-- remember the item count to know which playlists need the 15-minute
+-- full re-check.
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS youtube_item_count integer;
