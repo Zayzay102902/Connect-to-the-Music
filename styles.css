@@ -834,3 +834,7 @@ body {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+.tagline { max-width: 520px; margin: 20px auto 0; text-align: center; color: #e8d9ff; line-height: 1.6; }
+.legal-links { margin-top: 16px; text-align: center; font-size: 0.9rem; }
+.legal-links a { color: #d7b8ff; }
